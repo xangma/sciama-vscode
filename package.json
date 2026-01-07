@@ -1,9 +1,9 @@
 {
-  "name": "sciama-vscode-debugging",
+  "name": "sciama-vscode",
   "displayName": "Sciama Slurm Connect",
   "description": "Select Slurm resources and connect VS Code Remote-SSH through a compute allocation.",
   "version": "0.1.0",
-  "publisher": "sciama",
+  "publisher": "xangma",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -15,6 +15,7 @@
     "onView:sciamaSlurm.connectView"
   ],
   "main": "./out/extension.js",
+  "extensionKind": ["ui"],
   "contributes": {
     "commands": [
       {
@@ -170,11 +171,6 @@
           "default": "sciama",
           "description": "Prefix for generated SSH host aliases."
         },
-        "sciamaSlurm.connectAfterCreate": {
-          "type": "boolean",
-          "default": true,
-          "description": "Attempt to connect via Remote-SSH after creating the host entry."
-        },
         "sciamaSlurm.openInNewWindow": {
           "type": "boolean",
           "default": false,
@@ -193,7 +189,7 @@
         "sciamaSlurm.restoreSshConfigAfterConnect": {
           "type": "boolean",
           "default": true,
-          "description": "Restore Remote.SSH configFile after connecting when using a temporary SSH config."
+          "description": "Restore Remote.SSH configFile after disconnecting when using a temporary SSH config."
         },
         "sciamaSlurm.additionalSshOptions": {
           "type": "object",

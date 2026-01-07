@@ -33,7 +33,6 @@ interface SciamaConfig {
   defaultGpuType: string;
   defaultGpuCount: number;
   sshHostPrefix: string;
-  connectAfterCreate: boolean;
   openInNewWindow: boolean;
   remoteWorkspacePath: string;
   temporarySshConfigPath: string;
@@ -63,9 +62,19 @@ interface ClusterInfo {
   defaultPartition?: string;
 }
 
+type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
+
 let outputChannel: vscode.OutputChannel | undefined;
+let logFilePath: string | undefined;
 let extensionStoragePath: string | undefined;
 let extensionGlobalState: vscode.Memento | undefined;
+let activeWebview: vscode.Webview | undefined;
+let connectionState: ConnectionState = 'idle';
+let lastConnectionAlias: string | undefined;
+let previousRemoteSshConfigPath: string | undefined;
+let activeTempSshConfigPath: string | undefined;
+const PROFILE_STORE_KEY = 'sciamaSlurm.profiles';
+const ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionStoragePath = context.globalStorageUri.fsPath;
@@ -87,9 +96,98 @@ export function deactivate(): void {
 
 function getOutputChannel(): vscode.OutputChannel {
   if (!outputChannel) {
-    outputChannel = vscode.window.createOutputChannel('Sciama Slurm');
+    const baseChannel = vscode.window.createOutputChannel('Sciama Slurm');
+    outputChannel = {
+      name: baseChannel.name,
+      append: (value: string) => {
+        baseChannel.append(value);
+        appendLogFile(value);
+      },
+      appendLine: (value: string) => {
+        baseChannel.appendLine(value);
+        appendLogFile(`${value}
+`);
+      },
+      replace: (value: string) => {
+        baseChannel.replace(value);
+        appendLogFile(`
+--- Output replaced at ${new Date().toISOString()} ---
+${value}
+`);
+      },
+      clear: () => {
+        baseChannel.clear();
+        appendLogFile(`
+--- Output cleared at ${new Date().toISOString()} ---
+`);
+      },
+      show: (columnOrPreserveFocus?: vscode.ViewColumn | boolean, preserveFocus?: boolean) => {
+        if (typeof columnOrPreserveFocus === 'boolean' || columnOrPreserveFocus === undefined) {
+          baseChannel.show(columnOrPreserveFocus);
+        } else {
+          baseChannel.show(columnOrPreserveFocus, preserveFocus);
+        }
+      },
+      hide: () => {
+        baseChannel.hide();
+      },
+      dispose: () => {
+        baseChannel.dispose();
+      }
+    };
   }
   return outputChannel;
+}
+
+function resolveLogFilePath(): string {
+  if (logFilePath) {
+    return logFilePath;
+  }
+  const baseDir = extensionStoragePath || os.tmpdir();
+  logFilePath = path.join(baseDir, 'sciama-slurm.log');
+  return logFilePath;
+}
+
+async function ensureLogFile(): Promise<string> {
+  const filePath = resolveLogFilePath();
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  try {
+    await fs.access(filePath);
+  } catch {
+    await fs.writeFile(filePath, '', 'utf8');
+  }
+  return filePath;
+}
+
+function appendLogFile(text: string): void {
+  void (async () => {
+    const filePath = await ensureLogFile();
+    await fs.appendFile(filePath, text, 'utf8');
+  })().catch(() => {
+    // Ignore logging failures to avoid breaking the main flow.
+  });
+}
+
+async function openLogFile(): Promise<void> {
+  const filePath = await ensureLogFile();
+  const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+  await vscode.window.showTextDocument(doc, { preview: false });
+}
+
+async function openRemoteSshLog(): Promise<void> {
+  try {
+    await vscode.commands.executeCommand('opensshremotes.showLog');
+    return;
+  } catch {
+    // Fall through to output channel fallback.
+  }
+  try {
+    await vscode.commands.executeCommand(
+      'workbench.action.output.show.extension-output-ms-vscode-remote.remote-ssh'
+    );
+  } catch {
+    void vscode.window.showWarningMessage('Unable to open Remote-SSH logs.');
+  }
 }
 
 interface UiValues {
@@ -118,12 +216,81 @@ interface UiValues {
   sshHostPrefix: string;
   forwardAgent: boolean;
   requestTTY: boolean;
-  connectAfterCreate: boolean;
   temporarySshConfigPath: string;
   restoreSshConfigAfterConnect: boolean;
   sshQueryConfigPath: string;
   openInNewWindow: boolean;
   remoteWorkspacePath: string;
+}
+
+interface ProfileEntry {
+  name: string;
+  values: UiValues;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ProfileSummary {
+  name: string;
+  updatedAt: string;
+}
+
+type ProfileStore = Record<string, ProfileEntry>;
+
+function postToWebview(message: unknown): void {
+  if (!activeWebview) {
+    return;
+  }
+  void activeWebview.postMessage(message);
+}
+
+function setConnectionState(state: ConnectionState): void {
+  connectionState = state;
+  postToWebview({ command: 'connectionState', state });
+}
+
+function mergeUiValuesWithDefaults(values?: Partial<UiValues>): UiValues {
+  const defaults = getUiValuesFromConfig(getConfig());
+  if (!values) {
+    return defaults;
+  }
+  return {
+    ...defaults,
+    ...values
+  } as UiValues;
+}
+
+function getProfileStore(): ProfileStore {
+  if (!extensionGlobalState) {
+    return {};
+  }
+  return extensionGlobalState.get<ProfileStore>(PROFILE_STORE_KEY) || {};
+}
+
+function getActiveProfileName(): string | undefined {
+  if (!extensionGlobalState) {
+    return undefined;
+  }
+  const name = extensionGlobalState.get<string>(ACTIVE_PROFILE_KEY);
+  return name || undefined;
+}
+
+async function setActiveProfileName(name?: string): Promise<void> {
+  if (!extensionGlobalState) {
+    return;
+  }
+  await extensionGlobalState.update(ACTIVE_PROFILE_KEY, name);
+}
+
+function getProfileSummaries(store: ProfileStore): ProfileSummary[] {
+  return Object.values(store)
+    .map((profile) => ({ name: profile.name, updatedAt: profile.updatedAt }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function getProfileValues(name: string): UiValues | undefined {
+  const store = getProfileStore();
+  return store[name]?.values;
 }
 
 function getConfig(): SciamaConfig {
@@ -155,7 +322,6 @@ function getConfig(): SciamaConfig {
     defaultGpuType: (cfg.get<string>('defaultGpuType') || '').trim(),
     defaultGpuCount: cfg.get<number>('defaultGpuCount', 0),
     sshHostPrefix: (cfg.get<string>('sshHostPrefix') || '').trim(),
-    connectAfterCreate: cfg.get<boolean>('connectAfterCreate', true),
     openInNewWindow: cfg.get<boolean>('openInNewWindow', false),
     remoteWorkspacePath: (cfg.get<string>('remoteWorkspacePath') || '').trim(),
     temporarySshConfigPath: (cfg.get<string>('temporarySshConfigPath') || '').trim(),
@@ -185,6 +351,12 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
     const webview = view.webview;
+    activeWebview = webview;
+    view.onDidDispose(() => {
+      if (activeWebview === webview) {
+        activeWebview = undefined;
+      }
+    });
     webview.options = {
       enableScripts: true,
       localResourceRoots: [this.context.extensionUri]
@@ -194,28 +366,155 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
     webview.onDidReceiveMessage(async (message) => {
       switch (message.command) {
         case 'ready': {
-          const values = getUiValuesFromConfig(getConfig());
+          let activeProfile = getActiveProfileName();
+          const defaults = getUiValuesFromConfig(getConfig());
+          let values = defaults;
+          if (activeProfile) {
+            const stored = getProfileValues(activeProfile);
+            if (stored) {
+              values = { ...defaults, ...stored } as UiValues;
+            } else {
+              activeProfile = undefined;
+            }
+          }
           const host = firstLoginHostFromInput(values.loginHosts);
           const cached = host ? getCachedClusterInfo(host) : undefined;
           webview.postMessage({
             command: 'load',
             values,
             clusterInfo: cached?.info,
-            clusterInfoCachedAt: cached?.fetchedAt
+            clusterInfoCachedAt: cached?.fetchedAt,
+            profiles: getProfileSummaries(getProfileStore()),
+            activeProfile,
+            connectionState
           });
           break;
         }
-        case 'save': {
+        case 'connect': {
           const target = message.target === 'workspace'
             ? vscode.ConfigurationTarget.Workspace
             : vscode.ConfigurationTarget.Global;
           const uiValues = message.values as UiValues;
           await updateConfigFromUi(uiValues, target);
-          if (message.connect) {
-            await connectCommand(buildOverridesFromUi(uiValues), { interactive: false });
-          } else {
-            void vscode.window.showInformationMessage('Sciama Slurm settings saved.');
+          setConnectionState('connecting');
+          const overrides = buildOverridesFromUi(uiValues);
+          const connected = await connectCommand(overrides, { interactive: false });
+          setConnectionState(connected ? 'connected' : 'idle');
+          break;
+        }
+        case 'disconnect': {
+          setConnectionState('disconnecting');
+          const disconnected = await disconnectFromHost(lastConnectionAlias);
+          if (disconnected) {
+            await restoreRemoteSshConfigIfNeeded();
           }
+          setConnectionState(disconnected ? 'idle' : 'connected');
+          break;
+        }
+        case 'saveProfile': {
+          const rawName = typeof message.name === 'string' ? message.name : '';
+          const name = rawName.trim();
+          if (!name) {
+            webview.postMessage({
+              command: 'profiles',
+              profiles: getProfileSummaries(getProfileStore()),
+              activeProfile: getActiveProfileName(),
+              profileStatus: 'Enter a profile name before saving.',
+              profileError: true
+            });
+            break;
+          }
+          const uiValues = message.values as UiValues;
+          const store = getProfileStore();
+          const existing = store[name];
+          const now = new Date().toISOString();
+          store[name] = {
+            name,
+            values: uiValues,
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now
+          };
+          if (extensionGlobalState) {
+            await extensionGlobalState.update(PROFILE_STORE_KEY, store);
+            await setActiveProfileName(name);
+          }
+          webview.postMessage({
+            command: 'profiles',
+            profiles: getProfileSummaries(store),
+            activeProfile: name,
+            profileStatus: existing ? `Profile "${name}" updated.` : `Profile "${name}" saved.`
+          });
+          break;
+        }
+        case 'loadProfile': {
+          const rawName = typeof message.name === 'string' ? message.name : '';
+          const name = rawName.trim();
+          if (!name) {
+            webview.postMessage({
+              command: 'profiles',
+              profiles: getProfileSummaries(getProfileStore()),
+              activeProfile: getActiveProfileName(),
+              profileStatus: 'Select a profile to load.',
+              profileError: true
+            });
+            break;
+          }
+          const store = getProfileStore();
+          const profile = store[name];
+          if (!profile) {
+            webview.postMessage({
+              command: 'profiles',
+              profiles: getProfileSummaries(store),
+              activeProfile: getActiveProfileName(),
+              profileStatus: `Profile "${name}" not found.`,
+              profileError: true
+            });
+            break;
+          }
+          await setActiveProfileName(name);
+          const host = firstLoginHostFromInput(profile.values.loginHosts);
+          const cached = host ? getCachedClusterInfo(host) : undefined;
+          webview.postMessage({
+            command: 'load',
+            values: profile.values,
+            clusterInfo: cached?.info,
+            clusterInfoCachedAt: cached?.fetchedAt,
+            profiles: getProfileSummaries(store),
+            activeProfile: name,
+            connectionState,
+            profileStatus: `Loaded profile "${name}".`
+          });
+          break;
+        }
+        case 'deleteProfile': {
+          const rawName = typeof message.name === 'string' ? message.name : '';
+          const name = rawName.trim();
+          const store = getProfileStore();
+          if (!name || !store[name]) {
+            webview.postMessage({
+              command: 'profiles',
+              profiles: getProfileSummaries(store),
+              activeProfile: getActiveProfileName(),
+              profileStatus: 'Select a profile to delete.',
+              profileError: true
+            });
+            break;
+          }
+          delete store[name];
+          if (extensionGlobalState) {
+            await extensionGlobalState.update(PROFILE_STORE_KEY, store);
+          }
+          let activeProfile = getActiveProfileName();
+          if (activeProfile === name) {
+            activeProfile = undefined;
+            await setActiveProfileName(undefined);
+          }
+          webview.postMessage({
+            command: 'profiles',
+            profiles: getProfileSummaries(store),
+            activeProfile,
+            profileStatus: `Profile "${name}" deleted.`
+          });
           break;
         }
         case 'getClusterInfo': {
@@ -227,6 +526,14 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           void vscode.commands.executeCommand('workbench.action.openSettings', 'sciamaSlurm');
           break;
         }
+        case 'openLogs': {
+          await openLogFile();
+          break;
+        }
+        case 'openRemoteSshLog': {
+          await openRemoteSshLog();
+          break;
+        }
         default:
           break;
       }
@@ -234,21 +541,24 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
+
 async function connectCommand(
   overrides?: Partial<SciamaConfig>,
   options?: { interactive?: boolean }
-): Promise<void> {
+): Promise<boolean> {
   const cfg = getConfigWithOverrides(overrides);
   const interactive = options?.interactive !== false;
   const log = getOutputChannel();
   log.clear();
   log.appendLine('Sciama Slurm connect started.');
 
+  let didConnect = false;
+
   const loginHosts = await resolveLoginHosts(cfg);
   log.appendLine(`Login hosts resolved: ${loginHosts.join(', ') || '(none)'}`);
   if (loginHosts.length === 0) {
     void vscode.window.showErrorMessage('No login hosts available. Configure sciamaSlurm.loginHosts or loginHostsCommand.');
-    return;
+    return false;
   }
 
   let loginHost: string | undefined;
@@ -261,7 +571,7 @@ async function connectCommand(
     log.appendLine(`Using first login host: ${loginHost}`);
   }
   if (!loginHost) {
-    return;
+    return false;
   }
 
   let partition: string | undefined;
@@ -283,7 +593,7 @@ async function connectCommand(
 
     const partitionPick = await pickPartition(partitions, cfg.defaultPartition || defaultPartition);
     if (partitionPick === null) {
-      return;
+      return false;
     }
     partition = partitionPick;
 
@@ -307,43 +617,43 @@ async function connectCommand(
   if (interactive) {
     const nodesInput = await promptNumber('Nodes', cfg.defaultNodes, 1);
     if (!nodesInput) {
-      return;
+      return false;
     }
     nodes = nodesInput;
 
     const tasksInput = await promptNumber('Tasks per node', cfg.defaultTasksPerNode, 1);
     if (!tasksInput) {
-      return;
+      return false;
     }
     tasksPerNode = tasksInput;
 
     const cpusInput = await promptNumber('CPUs per task', cfg.defaultCpusPerTask, 1);
     if (!cpusInput) {
-      return;
+      return false;
     }
     cpusPerTask = cpusInput;
 
     const timeInput = await promptTime('Wall time', cfg.defaultTime || '01:00:00');
     if (!timeInput) {
-      return;
+      return false;
     }
     time = timeInput;
   } else {
     if (!nodes || nodes < 1) {
       void vscode.window.showErrorMessage('Default nodes is not set. Fill it in the side panel or settings.');
-      return;
+      return false;
     }
     if (!tasksPerNode || tasksPerNode < 1) {
       void vscode.window.showErrorMessage('Default tasks per node is not set. Fill it in the side panel or settings.');
-      return;
+      return false;
     }
     if (!cpusPerTask || cpusPerTask < 1) {
       void vscode.window.showErrorMessage('Default CPUs per task is not set. Fill it in the side panel or settings.');
-      return;
+      return false;
     }
     if (!time) {
       void vscode.window.showErrorMessage('Default wall time is not set. Fill it in the side panel or settings.');
-      return;
+      return false;
     }
   }
 
@@ -374,7 +684,7 @@ async function connectCommand(
   const remoteCommand = buildRemoteCommand(cfg, [...sallocArgs, ...cfg.extraSallocArgs, ...extraArgs]);
   if (!remoteCommand) {
     void vscode.window.showErrorMessage('RemoteCommand is empty. Check sciamaSlurm.proxyCommand.');
-    return;
+    return false;
   }
 
   const defaultAlias = buildDefaultAlias(cfg.sshHostPrefix || 'sciama', loginHost, partition, nodes, cpusPerTask);
@@ -387,58 +697,60 @@ async function connectCommand(
       validateInput: (value) => (value.trim().length === 0 ? 'Alias is required.' : undefined)
     });
     if (!aliasInput) {
-      return;
+      return false;
     }
     alias = aliasInput.trim();
   }
+
+  lastConnectionAlias = alias.trim();
 
   const hostEntry = buildHostEntry(alias.trim(), loginHost, cfg, remoteCommand);
   log.appendLine('Generated SSH host entry:');
   log.appendLine(hostEntry);
 
   let tempConfigPath: string | undefined;
-  let previousRemoteConfig: string | undefined;
-
-  try {
-    tempConfigPath = await writeTemporarySshConfig(alias.trim(), hostEntry, cfg);
-  } catch (error) {
-    void vscode.window.showErrorMessage(`Failed to write temporary SSH config: ${formatError(error)}`);
-    return;
-  }
 
   await ensureRemoteSshSettings();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
-  previousRemoteConfig = remoteCfg.get<string>('configFile') || '';
+  const currentRemoteConfig = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
+  const baseRemoteConfig = resolveBaseRemoteConfig(currentRemoteConfig);
+  const includePaths = resolveSshConfigIncludes(baseRemoteConfig);
+  previousRemoteSshConfigPath = baseRemoteConfig;
+  if (includePaths.length > 0) {
+    log.appendLine(`Temporary SSH config includes: ${includePaths.join(', ')}`);
+  }
+
+  try {
+    tempConfigPath = await writeTemporarySshConfig(hostEntry, cfg, includePaths);
+  } catch (error) {
+    void vscode.window.showErrorMessage(`Failed to write temporary SSH config: ${formatError(error)}`);
+    return false;
+  }
+
+  activeTempSshConfigPath = tempConfigPath;
   await remoteCfg.update('configFile', tempConfigPath, vscode.ConfigurationTarget.Global);
   await delay(300);
   await refreshRemoteSshHosts();
 
-  if (cfg.connectAfterCreate) {
-    const connected = await connectToHost(
-      alias.trim(),
-      cfg.openInNewWindow,
-      cfg.remoteWorkspacePath
-    );
-    if (!connected) {
-      void vscode.window.showWarningMessage(
-        `SSH host "${alias.trim()}" created, but auto-connect failed. Use Remote-SSH to connect.`,
-        'Show Output'
-      ).then((selection) => {
-        if (selection === 'Show Output') {
-          getOutputChannel().show(true);
-        }
-      });
-    }
-  } else {
-    void vscode.window.showInformationMessage(`SSH host "${alias.trim()}" created.`);
+  const connected = await connectToHost(
+    alias.trim(),
+    cfg.openInNewWindow,
+    cfg.remoteWorkspacePath
+  );
+  didConnect = connected;
+  if (!connected) {
+    void vscode.window.showWarningMessage(
+      `SSH host "${alias.trim()}" created, but auto-connect failed. Use Remote-SSH to connect.`,
+      'Show Output'
+    ).then((selection) => {
+      if (selection === 'Show Output') {
+        getOutputChannel().show(true);
+      }
+    });
+    await restoreRemoteSshConfigIfNeeded();
   }
 
-  if (cfg.restoreSshConfigAfterConnect) {
-    await delay(2000);
-    const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
-    const restored = previousRemoteConfig || undefined;
-    await remoteCfg.update('configFile', restored, vscode.ConfigurationTarget.Global);
-  }
+  return didConnect;
 }
 
 async function resolveLoginHosts(cfg: SciamaConfig): Promise<string[]> {
@@ -912,6 +1224,7 @@ function buildSallocArgs(params: {
   return args;
 }
 
+
 function buildRemoteCommand(cfg: SciamaConfig, sallocArgs: string[]): string {
   const proxyParts = [cfg.proxyCommand, ...cfg.proxyArgs.filter(Boolean)];
   const proxyCommand = proxyParts.filter(Boolean).join(' ').trim();
@@ -920,10 +1233,13 @@ function buildRemoteCommand(cfg: SciamaConfig, sallocArgs: string[]): string {
   }
   const sallocFlags = sallocArgs.map((arg) => `--salloc-arg=${arg}`);
   const fullProxyCommand = [proxyCommand, ...sallocFlags].join(' ').trim();
-  if (cfg.moduleLoad) {
-    return `${cfg.moduleLoad} && ${fullProxyCommand}`.trim();
+  const baseCommand = cfg.moduleLoad
+    ? `${cfg.moduleLoad} && ${fullProxyCommand}`.trim()
+    : fullProxyCommand;
+  if (!baseCommand) {
+    return '';
   }
-  return fullProxyCommand;
+  return baseCommand;
 }
 
 function buildDefaultAlias(
@@ -973,19 +1289,76 @@ function buildHostEntry(alias: string, loginHost: string, cfg: SciamaConfig, rem
 }
 
 async function writeTemporarySshConfig(
-  alias: string,
   entry: string,
-  cfg: SciamaConfig
+  cfg: SciamaConfig,
+  includePaths: string[]
 ): Promise<string> {
   const basePath = cfg.temporarySshConfigPath
     ? expandHome(cfg.temporarySshConfigPath)
     : path.join(extensionStoragePath || os.tmpdir(), 'sciama-ssh-config');
   const dir = path.dirname(basePath);
   await fs.mkdir(dir, { recursive: true });
-  const content = `# Temporary SSH config generated by Sciama Slurm Connect\n${entry}`;
+  const resolvedBase = path.resolve(basePath);
+  const includes = uniqueList(includePaths)
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map((value) => expandHome(value))
+    .filter((value) => value && path.resolve(value) !== resolvedBase);
+  const includeLines = includes.map((value) => `Include ${value}`);
+  const contentLines = ['# Temporary SSH config generated by Sciama Slurm Connect', entry.trimEnd()];
+  if (includeLines.length > 0) {
+    contentLines.push('', ...includeLines);
+  }
+  const content = `${contentLines.join('\n')}\n`;
   await fs.writeFile(basePath, content, 'utf8');
   return basePath;
 }
+
+function normalizeRemoteConfigPath(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function resolveBaseRemoteConfig(currentConfig?: string): string | undefined {
+  if (currentConfig && activeTempSshConfigPath && currentConfig === activeTempSshConfigPath && previousRemoteSshConfigPath) {
+    return previousRemoteSshConfigPath;
+  }
+  return currentConfig;
+}
+
+function resolveSshConfigIncludes(baseConfig?: string): string[] {
+  const includes: string[] = [];
+  if (baseConfig) {
+    includes.push(baseConfig);
+  }
+  includes.push('~/.ssh/config');
+  return uniqueList(includes);
+}
+
+async function restoreRemoteSshConfigIfNeeded(): Promise<void> {
+  const cfg = getConfig();
+  if (!cfg.restoreSshConfigAfterConnect) {
+    return;
+  }
+  if (!activeTempSshConfigPath) {
+    return;
+  }
+  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
+  const current = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
+  if (current && current !== activeTempSshConfigPath) {
+    return;
+  }
+  const restored = previousRemoteSshConfigPath || undefined;
+  await remoteCfg.update('configFile', restored, vscode.ConfigurationTarget.Global);
+  const log = getOutputChannel();
+  log.appendLine(`Restored Remote.SSH configFile ${restored ? `to ${restored}` : 'to default'}.`);
+  previousRemoteSshConfigPath = undefined;
+  activeTempSshConfigPath = undefined;
+}
+
 
 async function ensureRemoteSshSettings(): Promise<void> {
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
@@ -1051,12 +1424,13 @@ async function connectToHost(
     }
   }
 
+  const hostArg = { host: alias };
+
   if (openInNewWindow) {
     const commandCandidates: Array<[string, unknown]> = [
-      ['opensshremotes.openEmptyWindow', { host: alias, newWindow: true }],
-      ['opensshremotes.openEmptyWindow', { host: alias }],
+      ['opensshremotes.openEmptyWindow', hostArg],
       ['remote-ssh.connectToHost', alias],
-      ['opensshremotes.connectToHost', { host: alias }],
+      ['opensshremotes.connectToHost', hostArg],
       ['remote-ssh.openEmptyWindow', alias],
       ['remote-ssh.openEmptyWindowInCurrentWindow', alias]
     ];
@@ -1076,11 +1450,10 @@ async function connectToHost(
 
   try {
     const commandCandidates: Array<[string, unknown]> = [
-      ['opensshremotes.openEmptyWindowInCurrentWindow', { host: alias }],
-      ['opensshremotes.openEmptyWindow', { host: alias, newWindow: false }],
-      ['opensshremotes.openEmptyWindow', { host: alias }],
+      ['opensshremotes.openEmptyWindowInCurrentWindow', hostArg],
+      ['opensshremotes.openEmptyWindow', hostArg],
       ['remote-ssh.connectToHost', alias],
-      ['opensshremotes.connectToHost', { host: alias }],
+      ['opensshremotes.connectToHost', hostArg],
       ['remote-ssh.openEmptyWindowInCurrentWindow', alias],
       ['remote-ssh.openEmptyWindow', alias]
     ];
@@ -1099,6 +1472,56 @@ async function connectToHost(
   } finally {
     // No-op
   }
+}
+
+async function disconnectFromHost(alias?: string): Promise<boolean> {
+  const remoteExtension = vscode.extensions.getExtension('ms-vscode-remote.remote-ssh');
+  if (!remoteExtension) {
+    return false;
+  }
+  const log = getOutputChannel();
+  await remoteExtension.activate();
+  const availableCommands = await vscode.commands.getCommands(true);
+  const sshCommands = availableCommands.filter((command) => /ssh|openssh|remote\.close/i.test(command));
+  log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
+
+  const candidates: Array<[string, unknown]> = [];
+  if (alias) {
+    candidates.push(
+      ['opensshremotes.closeRemote', { host: alias }],
+      ['opensshremotes.closeRemote', alias],
+      ['opensshremotes.disconnect', { host: alias }],
+      ['opensshremotes.disconnect', alias],
+      ['opensshremotes.close', { host: alias }],
+      ['opensshremotes.close', alias],
+      ['remote-ssh.disconnectFromHost', alias],
+      ['remote-ssh.disconnectFromHost', { host: alias }]
+    );
+  }
+  candidates.push(
+    ['opensshremotes.closeRemote', undefined],
+    ['opensshremotes.disconnect', undefined],
+    ['opensshremotes.close', undefined],
+    ['remote-ssh.closeRemote', undefined],
+    ['remote-ssh.closeRemoteConnection', undefined],
+    ['remote-ssh.disconnect', undefined],
+    ['workbench.action.remote.closeRemoteConnection', undefined]
+  );
+
+  for (const [command, args] of candidates) {
+    if (!availableCommands.includes(command)) {
+      continue;
+    }
+    try {
+      log.appendLine(`Trying disconnect command: ${command}`);
+      await vscode.commands.executeCommand(command, args);
+      log.appendLine(`Disconnect command succeeded: ${command}`);
+      return true;
+    } catch (error) {
+      log.appendLine(`Disconnect command failed: ${command} -> ${formatError(error)}`);
+    }
+  }
+  return false;
 }
 
 function getUiValuesFromConfig(cfg: SciamaConfig): UiValues {
@@ -1128,7 +1551,6 @@ function getUiValuesFromConfig(cfg: SciamaConfig): UiValues {
     sshHostPrefix: cfg.sshHostPrefix || '',
     forwardAgent: cfg.forwardAgent,
     requestTTY: cfg.requestTTY,
-    connectAfterCreate: cfg.connectAfterCreate,
     openInNewWindow: cfg.openInNewWindow,
     remoteWorkspacePath: cfg.remoteWorkspacePath || '',
     temporarySshConfigPath: cfg.temporarySshConfigPath || '',
@@ -1166,7 +1588,6 @@ async function updateConfigFromUi(values: UiValues, target: vscode.Configuration
     ['sshHostPrefix', values.sshHostPrefix.trim()],
     ['forwardAgent', Boolean(values.forwardAgent)],
     ['requestTTY', Boolean(values.requestTTY)],
-    ['connectAfterCreate', Boolean(values.connectAfterCreate)],
     ['openInNewWindow', Boolean(values.openInNewWindow)],
     ['remoteWorkspacePath', values.remoteWorkspacePath.trim()],
     ['temporarySshConfigPath', values.temporarySshConfigPath.trim()],
@@ -1278,7 +1699,6 @@ function buildOverridesFromUi(values: UiValues): Partial<SciamaConfig> {
     sshHostPrefix: values.sshHostPrefix.trim(),
     forwardAgent: Boolean(values.forwardAgent),
     requestTTY: Boolean(values.requestTTY),
-    connectAfterCreate: Boolean(values.connectAfterCreate),
     openInNewWindow: Boolean(values.openInNewWindow),
     remoteWorkspacePath: values.remoteWorkspacePath.trim(),
     temporarySshConfigPath: values.temporarySshConfigPath.trim(),
@@ -1315,6 +1735,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .checkbox input { width: auto; }
     .buttons { display: flex; gap: 8px; }
     .buttons button { flex: 1; }
+    .hidden { display: none; }
     .hint { font-size: 11px; color: #555; margin-top: 4px; }
     details summary { cursor: pointer; margin-bottom: 6px; }
   </style>
@@ -1331,18 +1752,37 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="identityFile" type="text" />
     <div class="buttons" style="margin-top: 8px;">
       <button id="getClusterInfo">Get cluster info</button>
+      <button id="clearClusterInfo">Clear cluster info</button>
     </div>
     <div id="clusterStatus" class="hint"></div>
   </div>
 
+  <details class="section">
+    <summary>Profiles</summary>
+    <label for="profileSelect">Saved profiles</label>
+    <select id="profileSelect"></select>
+    <label for="profileName">Profile name</label>
+    <input id="profileName" type="text" placeholder="e.g. gpu-a100" />
+    <div class="buttons" style="margin-top: 8px;">
+      <button id="profileLoad">Load</button>
+      <button id="profileSave">Save profile</button>
+      <button id="profileDelete">Delete</button>
+    </div>
+    <div id="profileStatus" class="hint"></div>
+  </details>
+
   <div class="section">
-    <label for="defaultPartition">Partition</label>
-    <select id="defaultPartition" disabled></select>
+    <label for="defaultPartitionInput">Partition</label>
+    <select id="defaultPartitionSelect" class="hidden"></select>
+    <input id="defaultPartitionInput" type="text" list="partitionOptions" placeholder="(optional)" />
+    <datalist id="partitionOptions"></datalist>
     <div id="partitionMeta" class="hint"></div>
     <div class="row">
       <div>
-        <label for="defaultNodes">Nodes</label>
-        <select id="defaultNodes" disabled></select>
+        <label for="defaultNodesInput">Nodes</label>
+        <select id="defaultNodesSelect" class="hidden"></select>
+        <input id="defaultNodesInput" type="number" min="1" list="nodesOptions" />
+        <datalist id="nodesOptions"></datalist>
       </div>
       <div>
         <label for="defaultTasksPerNode">Tasks per node</label>
@@ -1351,22 +1791,30 @@ function getWebviewHtml(webview: vscode.Webview): string {
     </div>
     <div class="row">
       <div>
-        <label for="defaultCpusPerTask">CPUs per task</label>
-        <select id="defaultCpusPerTask" disabled></select>
+        <label for="defaultCpusPerTaskInput">CPUs per task</label>
+        <select id="defaultCpusPerTaskSelect" class="hidden"></select>
+        <input id="defaultCpusPerTaskInput" type="number" min="1" list="cpusOptions" />
+        <datalist id="cpusOptions"></datalist>
       </div>
       <div>
-        <label for="defaultMemoryMb">Memory per node</label>
-        <select id="defaultMemoryMb" disabled></select>
+        <label for="defaultMemoryMbInput">Memory per node</label>
+        <select id="defaultMemoryMbSelect" class="hidden"></select>
+        <input id="defaultMemoryMbInput" type="number" min="0" list="memoryOptions" placeholder="MB (optional)" />
+        <datalist id="memoryOptions"></datalist>
       </div>
     </div>
     <div class="row">
       <div>
-        <label for="defaultGpuType">GPU type</label>
-        <select id="defaultGpuType" disabled></select>
+        <label for="defaultGpuTypeInput">GPU type</label>
+        <select id="defaultGpuTypeSelect" class="hidden"></select>
+        <input id="defaultGpuTypeInput" type="text" list="gpuTypeOptions" placeholder="Any" />
+        <datalist id="gpuTypeOptions"></datalist>
       </div>
       <div>
-        <label for="defaultGpuCount">GPU count</label>
-        <select id="defaultGpuCount" disabled></select>
+        <label for="defaultGpuCountInput">GPU count</label>
+        <select id="defaultGpuCountSelect" class="hidden"></select>
+        <input id="defaultGpuCountInput" type="number" min="0" list="gpuCountOptions" />
+        <datalist id="gpuCountOptions"></datalist>
       </div>
     </div>
     <label for="defaultTime">Wall time</label>
@@ -1374,10 +1822,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
   </div>
 
   <div class="section">
-    <div class="checkbox">
-      <input id="connectAfterCreate" type="checkbox" />
-      <label for="connectAfterCreate">Connect after create</label>
-    </div>
     <div class="checkbox">
       <input id="openInNewWindow" type="checkbox" />
       <label for="openInNewWindow">Open in new window</label>
@@ -1418,7 +1862,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="temporarySshConfigPath" type="text" />
     <div class="checkbox">
       <input id="restoreSshConfigAfterConnect" type="checkbox" />
-      <label for="restoreSshConfigAfterConnect">Restore Remote.SSH config after connect</label>
+      <label for="restoreSshConfigAfterConnect">Restore Remote.SSH config after disconnect</label>
     </div>
     <label for="sshQueryConfigPath">SSH query config path</label>
     <input id="sshQueryConfigPath" type="text" />
@@ -1439,27 +1883,116 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <button id="refresh">Reload saved values</button>
       <button id="openSettings">Open Settings</button>
     </div>
+    <div class="buttons" style="margin-top: 8px;">
+      <button id="openLogs" type="button">Open logs</button>
+      <button id="openRemoteSshLog" type="button">Remote-SSH log</button>
+    </div>
   </details>
 
   <div class="section">
     <div class="buttons" style="margin-top: 8px;">
-      <button id="save">Save</button>
-      <button id="connect">Save + Connect</button>
+      <button id="connectToggle">Connect</button>
     </div>
-    <div class="hint">Saved to user settings by default (change in Advanced).</div>
+    <div id="connectStatus" class="hint"></div>
+    <div class="hint">Defaults save on connect (change in Advanced).</div>
     <div class="hint">Connections use a temporary SSH config; your main SSH config is not modified.</div>
   </div>
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     let clusterInfo = null;
+    let clusterMode = false;
     let lastValues = {};
+    let connectionState = 'idle';
+
+    const resourceFields = {
+      defaultPartition: { select: 'defaultPartitionSelect', input: 'defaultPartitionInput', list: 'partitionOptions' },
+      defaultNodes: { select: 'defaultNodesSelect', input: 'defaultNodesInput', list: 'nodesOptions' },
+      defaultCpusPerTask: { select: 'defaultCpusPerTaskSelect', input: 'defaultCpusPerTaskInput', list: 'cpusOptions' },
+      defaultMemoryMb: { select: 'defaultMemoryMbSelect', input: 'defaultMemoryMbInput', list: 'memoryOptions' },
+      defaultGpuType: { select: 'defaultGpuTypeSelect', input: 'defaultGpuTypeInput', list: 'gpuTypeOptions' },
+      defaultGpuCount: { select: 'defaultGpuCountSelect', input: 'defaultGpuCountInput', list: 'gpuCountOptions' }
+    };
 
     function setStatus(text, isError) {
       const el = document.getElementById('clusterStatus');
       if (!el) return;
       el.textContent = text || '';
       el.style.color = isError ? '#b00020' : '#555';
+    }
+
+    function setProfileStatus(text, isError) {
+      const el = document.getElementById('profileStatus');
+      if (!el) return;
+      el.textContent = text || '';
+      el.style.color = isError ? '#b00020' : '#555';
+    }
+
+    function setConnectState(state) {
+      connectionState = state || 'idle';
+      const button = document.getElementById('connectToggle');
+      const status = document.getElementById('connectStatus');
+      if (!button || !status) return;
+      let label = 'Connect';
+      let disabled = false;
+      let statusText = '';
+      if (connectionState === 'connecting') {
+        label = 'Connecting...';
+        disabled = true;
+        statusText = 'Connecting...';
+      } else if (connectionState === 'connected') {
+        label = 'Disconnect';
+        statusText = 'Connected.';
+      } else if (connectionState === 'disconnecting') {
+        label = 'Disconnecting...';
+        disabled = true;
+        statusText = 'Disconnecting...';
+      }
+      button.textContent = label;
+      button.disabled = disabled;
+      status.textContent = statusText;
+    }
+
+    function updateProfileList(list, activeName) {
+      const select = document.getElementById('profileSelect');
+      if (!select) return;
+      select.innerHTML = '';
+      const items = Array.isArray(list) ? list : [];
+      if (items.length === 0) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No profiles saved';
+        select.appendChild(option);
+        select.value = '';
+        return;
+      }
+      items.forEach((profile) => {
+        const option = document.createElement('option');
+        option.value = profile.name;
+        option.textContent = profile.name;
+        select.appendChild(option);
+      });
+      if (activeName && items.some((profile) => profile.name === activeName)) {
+        select.value = activeName;
+      } else {
+        select.value = items[0].name;
+      }
+      const nameInput = document.getElementById('profileName');
+      if (nameInput && select.value) {
+        nameInput.value = select.value;
+      }
+    }
+
+    function getProfileNameInput() {
+      const input = document.getElementById('profileName');
+      if (!input) return '';
+      return input.value.trim();
+    }
+
+    function getSelectedProfileName() {
+      const select = document.getElementById('profileSelect');
+      if (!select) return '';
+      return select.value || '';
     }
 
     function formatMem(mb) {
@@ -1472,8 +2005,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
       return mb + ' MB';
     }
 
-    function setSelectOptions(id, options, selectedValue) {
-      const select = document.getElementById(id);
+    function setSelectOptions(selectId, options, selectedValue) {
+      const select = document.getElementById(selectId);
       if (!select) return;
       select.innerHTML = '';
       options.forEach((opt) => {
@@ -1493,21 +2026,103 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
     }
 
-    function setResourceDisabled(disabled) {
-      ['defaultPartition', 'defaultNodes', 'defaultCpusPerTask', 'defaultMemoryMb', 'defaultGpuType', 'defaultGpuCount'].forEach((id) => {
-        const el = document.getElementById(id);
-        if (el) el.disabled = disabled;
+    function setInputOptions(inputId, listId, options, selectedValue) {
+      const input = document.getElementById(inputId);
+      const list = document.getElementById(listId);
+      if (!input || !list) return;
+      list.innerHTML = '';
+      options.forEach((opt) => {
+        const option = document.createElement('option');
+        const value = opt.value === undefined || opt.value === null ? '' : opt.value;
+        option.value = String(value);
+        option.textContent = opt.label ?? String(value);
+        list.appendChild(option);
       });
+      const current = input.value;
+      if (selectedValue !== undefined && selectedValue !== null && selectedValue !== '') {
+        input.value = String(selectedValue);
+      } else if (!current && options.length > 0) {
+        input.value = String(options[0].value ?? '');
+      }
+    }
+
+    function setFieldOptions(fieldKey, options, selectedValue) {
+      const field = resourceFields[fieldKey];
+      if (!field) return;
+      setSelectOptions(field.select, options, selectedValue);
+      setInputOptions(field.input, field.list, options, selectedValue);
+    }
+
+    function clearDatalist(listId) {
+      const list = document.getElementById(listId);
+      if (list) list.innerHTML = '';
+    }
+
+    function clearResourceLists() {
+      Object.values(resourceFields).forEach((field) => {
+        if (field.list) {
+          clearDatalist(field.list);
+        }
+      });
+    }
+
+    function setClusterMode(enabled) {
+      clusterMode = enabled;
+      Object.values(resourceFields).forEach((field) => {
+        const select = document.getElementById(field.select);
+        const input = document.getElementById(field.input);
+        if (!select || !input) return;
+        if (enabled) {
+          if (input.value) {
+            select.value = input.value;
+          }
+          select.classList.remove('hidden');
+          input.classList.add('hidden');
+        } else {
+          if (select.value) {
+            input.value = select.value;
+          }
+          input.classList.remove('hidden');
+          select.classList.add('hidden');
+        }
+      });
+    }
+
+    function setFieldDisabled(fieldKey, disabled) {
+      const field = resourceFields[fieldKey];
+      if (!field) return;
+      const select = document.getElementById(field.select);
+      const input = document.getElementById(field.input);
+      if (select) select.disabled = disabled;
+      if (input) input.disabled = disabled;
+    }
+
+    function setResourceDisabled(disabled) {
+      Object.keys(resourceFields).forEach((key) => setFieldDisabled(key, disabled));
       if (disabled) {
-        setSelectOptions('defaultPartition', [{ value: '', label: 'Click Get cluster info' }], '');
-        setSelectOptions('defaultNodes', [{ value: '', label: '-' }], '');
-        setSelectOptions('defaultCpusPerTask', [{ value: '', label: '-' }], '');
-        setSelectOptions('defaultMemoryMb', [{ value: '', label: 'Use default' }], '');
-        setSelectOptions('defaultGpuType', [{ value: '', label: 'None' }], '');
-        setSelectOptions('defaultGpuCount', [{ value: '0', label: '0' }], '0');
+        clearResourceLists();
         const meta = document.getElementById('partitionMeta');
         if (meta) meta.textContent = '';
       }
+    }
+
+    function clearClusterInfoUi() {
+      const preserved = {};
+      Object.keys(resourceFields).forEach((key) => {
+        preserved[key] = getValue(key);
+      });
+      clusterInfo = null;
+      setClusterMode(false);
+      setResourceDisabled(false);
+      clearResourceLists();
+      Object.keys(preserved).forEach((key) => {
+        if (preserved[key] !== undefined && preserved[key] !== null) {
+          setValue(key, preserved[key]);
+        }
+      });
+      const meta = document.getElementById('partitionMeta');
+      if (meta) meta.textContent = '';
+      setStatus('Cluster info cleared. Enter values manually or click \"Get cluster info\".', false);
     }
 
     function buildRangeOptions(maxValue) {
@@ -1549,10 +2164,21 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     function updatePartitionDetails() {
       if (!clusterInfo || !clusterInfo.partitions) return;
-      const partitionSelect = document.getElementById('defaultPartition');
-      const selected = partitionSelect ? partitionSelect.value : '';
-      const chosen = clusterInfo.partitions.find((p) => p.name === selected) || clusterInfo.partitions[0];
-      if (!chosen) return;
+      const selected = getValue('defaultPartition').trim();
+      let chosen = selected ? clusterInfo.partitions.find((p) => p.name === selected) : undefined;
+      if (!chosen && !selected) {
+        chosen = clusterInfo.partitions[0];
+      }
+      if (!chosen) {
+        const meta = document.getElementById('partitionMeta');
+        if (meta) meta.textContent = '';
+        clearDatalist('nodesOptions');
+        clearDatalist('cpusOptions');
+        clearDatalist('memoryOptions');
+        clearDatalist('gpuTypeOptions');
+        clearDatalist('gpuCountOptions');
+        return;
+      }
 
       const meta = document.getElementById('partitionMeta');
       if (meta) {
@@ -1583,56 +2209,67 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const preferredCpus = getValue('defaultCpusPerTask') || lastValues.defaultCpusPerTask;
       const preferredMem = getValue('defaultMemoryMb') || lastValues.defaultMemoryMb;
 
-      setSelectOptions('defaultNodes', buildRangeOptions(chosen.nodes), preferredNodes);
-      setSelectOptions('defaultCpusPerTask', buildRangeOptions(chosen.cpus), preferredCpus);
-      setSelectOptions('defaultMemoryMb', buildMemoryOptions(chosen.memMb), preferredMem);
+      setFieldOptions('defaultNodes', buildRangeOptions(chosen.nodes), preferredNodes);
+      setFieldOptions('defaultCpusPerTask', buildRangeOptions(chosen.cpus), preferredCpus);
+      setFieldOptions('defaultMemoryMb', buildMemoryOptions(chosen.memMb), preferredMem);
 
       const gpuTypes = chosen.gpuTypes || {};
       const gpuTypeKeys = Object.keys(gpuTypes);
       const preferredGpuType = getValue('defaultGpuType') || lastValues.defaultGpuType;
       const preferredGpuCount = getValue('defaultGpuCount') || lastValues.defaultGpuCount;
 
-      const gpuTypeSelect = document.getElementById('defaultGpuType');
-      const gpuCountSelect = document.getElementById('defaultGpuCount');
       if (gpuTypeKeys.length === 0) {
-        setSelectOptions('defaultGpuType', [{ value: '', label: 'None' }], '');
-        setSelectOptions('defaultGpuCount', [{ value: '0', label: '0' }], '0');
-        if (gpuTypeSelect) gpuTypeSelect.disabled = true;
-        if (gpuCountSelect) gpuCountSelect.disabled = true;
+        setFieldOptions('defaultGpuType', [{ value: '', label: 'None' }], '');
+        setFieldOptions('defaultGpuCount', [{ value: '0', label: '0' }], preferredGpuCount);
+        setFieldDisabled('defaultGpuType', true);
+        setFieldDisabled('defaultGpuCount', true);
       } else {
         const typeOptions = [{ value: '', label: 'Any' }];
         gpuTypeKeys.sort().forEach((key) => {
           const label = key ? key : 'Generic';
           typeOptions.push({ value: key, label });
         });
-        setSelectOptions('defaultGpuType', typeOptions, preferredGpuType);
-        const selectedType = gpuTypeSelect ? gpuTypeSelect.value : '';
+        setFieldOptions('defaultGpuType', typeOptions, preferredGpuType);
+        const selectedType = getValue('defaultGpuType');
         const maxGpu = selectedType ? gpuTypes[selectedType] : chosen.gpuMax;
         const countOptions = [{ value: '0', label: '0' }, ...buildRangeOptions(maxGpu)];
-        setSelectOptions('defaultGpuCount', countOptions, preferredGpuCount);
-        if (gpuTypeSelect) gpuTypeSelect.disabled = false;
-        if (gpuCountSelect) gpuCountSelect.disabled = false;
+        setFieldOptions('defaultGpuCount', countOptions, preferredGpuCount);
+        setFieldDisabled('defaultGpuType', false);
+        setFieldDisabled('defaultGpuCount', false);
       }
     }
 
     function applyClusterInfo(info) {
+      const manualPartition = getValue('defaultPartition');
       clusterInfo = info;
       if (!info || !info.partitions || info.partitions.length === 0) {
         setStatus('No partitions found.', true);
-        setResourceDisabled(true);
+        clearResourceLists();
+        setClusterMode(false);
+        setResourceDisabled(false);
         return;
       }
       setResourceDisabled(false);
+      setClusterMode(true);
       const options = info.partitions.map((partition) => ({
         value: partition.name,
         label: partition.isDefault ? partition.name + ' (default)' : partition.name
       }));
-      setSelectOptions('defaultPartition', options, lastValues.defaultPartition || info.defaultPartition);
+      const preferredPartition = manualPartition || lastValues.defaultPartition || info.defaultPartition;
+      setFieldOptions('defaultPartition', options, preferredPartition);
       updatePartitionDetails();
       setStatus('Loaded ' + info.partitions.length + ' partitions.', false);
     }
 
     function setValue(id, value) {
+      if (resourceFields[id]) {
+        const field = resourceFields[id];
+        const select = document.getElementById(field.select);
+        const input = document.getElementById(field.input);
+        if (select) select.value = value ?? '';
+        if (input) input.value = value ?? '';
+        return;
+      }
       const el = document.getElementById(id);
       if (!el) return;
       if (el.type === 'checkbox') {
@@ -1643,6 +2280,15 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function getValue(id) {
+      if (resourceFields[id]) {
+        const field = resourceFields[id];
+        const el = document.getElementById(clusterMode ? field.select : field.input);
+        if (el) {
+          return el.value || '';
+        }
+        const fallback = document.getElementById(field.input);
+        return fallback ? fallback.value || '' : '';
+      }
       const el = document.getElementById(id);
       if (!el) return '';
       if (el.type === 'checkbox') {
@@ -1681,10 +2327,21 @@ function getWebviewHtml(webview: vscode.Webview): string {
         sshQueryConfigPath: getValue('sshQueryConfigPath'),
         forwardAgent: getValue('forwardAgent'),
         requestTTY: getValue('requestTTY'),
-        connectAfterCreate: getValue('connectAfterCreate'),
         openInNewWindow: getValue('openInNewWindow'),
         remoteWorkspacePath: getValue('remoteWorkspacePath')
       };
+    }
+
+    function applyMessageState(message) {
+      if (message.profiles) {
+        updateProfileList(message.profiles, message.activeProfile);
+      }
+      if (message.connectionState) {
+        setConnectState(message.connectionState);
+      }
+      if (message.profileStatus) {
+        setProfileStatus(message.profileStatus, Boolean(message.profileError));
+      }
     }
 
     window.addEventListener('message', (event) => {
@@ -1700,14 +2357,26 @@ function getWebviewHtml(webview: vscode.Webview): string {
             setStatus('Loaded cached cluster info (' + cachedAt + ').', false);
           }
         } else {
-          setResourceDisabled(true);
-          setStatus('Click "Get cluster info" to populate partitions.', false);
+          clusterInfo = null;
+          clearResourceLists();
+          const meta = document.getElementById('partitionMeta');
+          if (meta) meta.textContent = '';
+          setClusterMode(false);
+          setResourceDisabled(false);
+          setStatus('Enter values manually or click "Get cluster info" to populate suggestions.', false);
         }
+        applyMessageState(message);
       } else if (message.command === 'clusterInfo') {
         applyClusterInfo(message.info);
+        applyMessageState(message);
       } else if (message.command === 'clusterInfoError') {
         setStatus(message.message || 'Failed to load cluster info.', true);
-        setResourceDisabled(true);
+        setResourceDisabled(false);
+        applyMessageState(message);
+      } else if (message.command === 'profiles') {
+        applyMessageState(message);
+      } else if (message.command === 'connectionState') {
+        setConnectState(message.state || 'idle');
       }
     });
 
@@ -1719,30 +2388,85 @@ function getWebviewHtml(webview: vscode.Webview): string {
       });
     });
 
-    document.getElementById('defaultPartition').addEventListener('change', () => {
-      updatePartitionDetails();
+    document.getElementById('clearClusterInfo').addEventListener('click', () => {
+      clearClusterInfoUi();
     });
 
-    document.getElementById('defaultGpuType').addEventListener('change', () => {
-      updatePartitionDetails();
+    function addFieldListener(fieldKey, handler) {
+      const field = resourceFields[fieldKey];
+      if (!field) return;
+      [field.select, field.input].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', handler);
+      });
+    }
+
+    addFieldListener('defaultPartition', updatePartitionDetails);
+    addFieldListener('defaultGpuType', updatePartitionDetails);
+
+    document.getElementById('profileSelect').addEventListener('change', () => {
+      const name = getSelectedProfileName();
+      const input = document.getElementById('profileName');
+      if (input) input.value = name;
     });
 
-    document.getElementById('save').addEventListener('click', () => {
+    document.getElementById('profileSave').addEventListener('click', () => {
+      const name = getProfileNameInput() || getSelectedProfileName();
+      if (!name) {
+        setProfileStatus('Enter a profile name to save.', true);
+        return;
+      }
+      setProfileStatus('Saving profile...', false);
       vscode.postMessage({
-        command: 'save',
-        values: gather(),
-        target: document.getElementById('saveTarget').value,
-        connect: false
+        command: 'saveProfile',
+        name,
+        values: gather()
       });
     });
-    document.getElementById('connect').addEventListener('click', () => {
+
+    document.getElementById('profileLoad').addEventListener('click', () => {
+      const name = getSelectedProfileName();
+      if (!name) {
+        setProfileStatus('Select a profile to load.', true);
+        return;
+      }
+      setProfileStatus('Loading profile...', false);
       vscode.postMessage({
-        command: 'save',
-        values: gather(),
-        target: document.getElementById('saveTarget').value,
-        connect: true
+        command: 'loadProfile',
+        name
       });
     });
+
+    document.getElementById('profileDelete').addEventListener('click', () => {
+      const name = getSelectedProfileName();
+      if (!name) {
+        setProfileStatus('Select a profile to delete.', true);
+        return;
+      }
+      if (!confirm('Delete profile "' + name + '"?')) {
+        return;
+      }
+      setProfileStatus('Deleting profile...', false);
+      vscode.postMessage({
+        command: 'deleteProfile',
+        name
+      });
+    });
+
+    document.getElementById('connectToggle').addEventListener('click', () => {
+      if (connectionState === 'connected') {
+        setConnectState('disconnecting');
+        vscode.postMessage({ command: 'disconnect' });
+        return;
+      }
+      setConnectState('connecting');
+      vscode.postMessage({
+        command: 'connect',
+        values: gather(),
+        target: document.getElementById('saveTarget').value
+      });
+    });
+
     document.getElementById('refresh').addEventListener('click', () => {
       vscode.postMessage({ command: 'ready' });
     });
@@ -1750,6 +2474,15 @@ function getWebviewHtml(webview: vscode.Webview): string {
       vscode.postMessage({ command: 'openSettings' });
     });
 
+    document.getElementById('openLogs').addEventListener('click', () => {
+      vscode.postMessage({ command: 'openLogs' });
+    });
+
+    document.getElementById('openRemoteSshLog').addEventListener('click', () => {
+      vscode.postMessage({ command: 'openRemoteSshLog' });
+    });
+
+    setConnectState('idle');
     vscode.postMessage({ command: 'ready' });
   </script>
 </body>
