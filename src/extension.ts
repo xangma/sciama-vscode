@@ -75,6 +75,7 @@ let previousRemoteSshConfigPath: string | undefined;
 let activeTempSshConfigPath: string | undefined;
 const PROFILE_STORE_KEY = 'sciamaSlurm.profiles';
 const ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
+const PENDING_RESTORE_KEY = 'sciamaSlurm.pendingRestore';
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionStoragePath = context.globalStorageUri.fsPath;
@@ -83,6 +84,8 @@ export function activate(context: vscode.ExtensionContext): void {
     void connectCommand();
   });
   context.subscriptions.push(disposable);
+
+  void maybeRestorePendingOnStartup();
 
   const viewProvider = new SlurmConnectViewProvider(context);
   context.subscriptions.push(
@@ -237,6 +240,14 @@ interface ProfileSummary {
 
 type ProfileStore = Record<string, ProfileEntry>;
 
+interface PendingRestoreState {
+  tempConfigPath: string;
+  previousConfigPath?: string;
+  alias: string;
+  openInNewWindow: boolean;
+  createdAt: string;
+}
+
 function postToWebview(message: unknown): void {
   if (!activeWebview) {
     return;
@@ -291,6 +302,39 @@ function getProfileSummaries(store: ProfileStore): ProfileSummary[] {
 function getProfileValues(name: string): UiValues | undefined {
   const store = getProfileStore();
   return store[name]?.values;
+}
+
+function getPendingRestore(): PendingRestoreState | undefined {
+  if (!extensionGlobalState) {
+    return undefined;
+  }
+  return extensionGlobalState.get<PendingRestoreState>(PENDING_RESTORE_KEY);
+}
+
+async function setPendingRestore(state?: PendingRestoreState): Promise<void> {
+  if (!extensionGlobalState) {
+    return;
+  }
+  await extensionGlobalState.update(PENDING_RESTORE_KEY, state);
+}
+
+async function clearPendingRestore(): Promise<void> {
+  await setPendingRestore(undefined);
+}
+
+async function maybeRestorePendingOnStartup(): Promise<void> {
+  const pending = getPendingRestore();
+  if (!pending) {
+    return;
+  }
+  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
+  const current = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
+  if (!current || current !== pending.tempConfigPath) {
+    await clearPendingRestore();
+    return;
+  }
+  await delay(500);
+  await restoreRemoteSshConfigIfNeeded();
 }
 
 function getConfig(): SciamaConfig {
@@ -729,6 +773,13 @@ async function connectCommand(
 
   activeTempSshConfigPath = tempConfigPath;
   await remoteCfg.update('configFile', tempConfigPath, vscode.ConfigurationTarget.Global);
+  await setPendingRestore({
+    tempConfigPath,
+    previousConfigPath: baseRemoteConfig || undefined,
+    alias: alias.trim(),
+    openInNewWindow: cfg.openInNewWindow,
+    createdAt: new Date().toISOString()
+  });
   await delay(300);
   await refreshRemoteSshHosts();
 
@@ -738,6 +789,10 @@ async function connectCommand(
     cfg.remoteWorkspacePath
   );
   didConnect = connected;
+  if (connected) {
+    await delay(500);
+    await restoreRemoteSshConfigIfNeeded();
+  }
   if (!connected) {
     void vscode.window.showWarningMessage(
       `SSH host "${alias.trim()}" created, but auto-connect failed. Use Remote-SSH to connect.`,
@@ -1338,25 +1393,34 @@ function resolveSshConfigIncludes(baseConfig?: string): string[] {
   return uniqueList(includes);
 }
 
-async function restoreRemoteSshConfigIfNeeded(): Promise<void> {
+async function restoreRemoteSshConfigIfNeeded(): Promise<boolean> {
   const cfg = getConfig();
   if (!cfg.restoreSshConfigAfterConnect) {
-    return;
+    await clearPendingRestore();
+    return false;
   }
-  if (!activeTempSshConfigPath) {
-    return;
+  const pending = getPendingRestore();
+  const tempPath = activeTempSshConfigPath || pending?.tempConfigPath;
+  if (!tempPath) {
+    await clearPendingRestore();
+    return false;
   }
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const current = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
-  if (current && current !== activeTempSshConfigPath) {
-    return;
+  if (current && current !== tempPath) {
+    if (pending && current === normalizeRemoteConfigPath(pending.previousConfigPath)) {
+      await clearPendingRestore();
+    }
+    return false;
   }
-  const restored = previousRemoteSshConfigPath || undefined;
+  const restored = previousRemoteSshConfigPath ?? pending?.previousConfigPath;
   await remoteCfg.update('configFile', restored, vscode.ConfigurationTarget.Global);
   const log = getOutputChannel();
   log.appendLine(`Restored Remote.SSH configFile ${restored ? `to ${restored}` : 'to default'}.`);
   previousRemoteSshConfigPath = undefined;
   activeTempSshConfigPath = undefined;
+  await clearPendingRestore();
+  return true;
 }
 
 
@@ -1371,6 +1435,18 @@ async function ensureRemoteSshSettings(): Promise<void> {
     );
     if (enable === 'Enable') {
       await remoteCfg.update('enableRemoteCommand', true, vscode.ConfigurationTarget.Global);
+    }
+  }
+
+  const lockfilesInTmp = remoteCfg.get<boolean>('lockfilesInTmp', false);
+  if (!lockfilesInTmp) {
+    const enable = await vscode.window.showWarningMessage(
+      'Remote.SSH: Lockfiles In Tmp is disabled. This is recommended on shared filesystems.',
+      'Enable',
+      'Ignore'
+    );
+    if (enable === 'Enable') {
+      await remoteCfg.update('lockfilesInTmp', true, vscode.ConfigurationTarget.Global);
     }
   }
 }
@@ -1723,11 +1799,34 @@ function getWebviewHtml(webview: vscode.Webview): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sciama Slurm</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 12px; color: #222; }
+    :root { color-scheme: light dark; }
+    body {
+      font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+      padding: 12px;
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+    }
     h2 { font-size: 16px; margin: 0 0 12px 0; }
     .section { margin-bottom: 16px; }
-    label { font-size: 12px; display: block; margin-bottom: 4px; }
+    label { font-size: 12px; display: block; margin-bottom: 4px; color: var(--vscode-foreground); }
     input, textarea, select, button { width: 100%; box-sizing: border-box; font-size: 12px; padding: 6px; }
+    input:not([type="checkbox"]), textarea, select {
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      border: 1px solid var(--vscode-input-border);
+    }
+    input:not([type="checkbox"]):focus, textarea:focus, select:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 0;
+    }
+    button {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: 1px solid var(--vscode-button-background);
+      cursor: pointer;
+    }
+    button:hover { background: var(--vscode-button-hoverBackground); }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
     textarea { resize: vertical; min-height: 48px; }
     .row { display: flex; gap: 8px; }
     .row > div { flex: 1; }
@@ -1736,8 +1835,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .buttons { display: flex; gap: 8px; }
     .buttons button { flex: 1; }
     .hidden { display: none; }
-    .hint { font-size: 11px; color: #555; margin-top: 4px; }
-    details summary { cursor: pointer; margin-bottom: 6px; }
+    .hint { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
+    details summary { cursor: pointer; margin-bottom: 6px; color: var(--vscode-foreground); }
   </style>
 </head>
 <body>
@@ -1862,7 +1961,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="temporarySshConfigPath" type="text" />
     <div class="checkbox">
       <input id="restoreSshConfigAfterConnect" type="checkbox" />
-      <label for="restoreSshConfigAfterConnect">Restore Remote.SSH config after disconnect</label>
+      <label for="restoreSshConfigAfterConnect">Restore Remote.SSH config after connect</label>
     </div>
     <label for="sshQueryConfigPath">SSH query config path</label>
     <input id="sshQueryConfigPath" type="text" />

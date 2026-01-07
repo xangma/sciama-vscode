@@ -108,7 +108,7 @@
         },
         "sciamaSlurm.proxyCommand": {
           "type": "string",
-          "default": "python vscode-shell-proxy.py",
+          "default": "python /usr/bin/vscode-shell-proxy.py",
           "description": "Command that launches the Slurm proxy script on the remote host."
         },
         "sciamaSlurm.proxyArgs": {
@@ -189,7 +189,7 @@
         "sciamaSlurm.restoreSshConfigAfterConnect": {
           "type": "boolean",
           "default": true,
-          "description": "Restore Remote.SSH configFile after disconnecting when using a temporary SSH config."
+          "description": "Restore Remote.SSH configFile after connecting when using a temporary SSH config."
         },
         "sciamaSlurm.additionalSshOptions": {
           "type": "object",
