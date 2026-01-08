@@ -215,7 +215,8 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "vscode:prepublish": "npm run compile"
+    "vscode:prepublish": "npm run compile",
+    "test": "npm run compile && node ./out/test/extension.test.js"
   },
   "devDependencies": {
     "@types/node": "^18.19.3",

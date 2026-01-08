@@ -4,6 +4,13 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { buildHostEntry, buildTemporarySshConfigContent, expandHome } from './utils/sshConfig';
+import {
+  ClusterInfo,
+  getMaxFieldCount,
+  hasMeaningfulClusterInfo,
+  parsePartitionInfoOutput
+} from './utils/clusterInfo';
 
 const execFileAsync = promisify(execFile);
 
@@ -47,22 +54,6 @@ interface PartitionResult {
   defaultPartition?: string;
 }
 
-interface PartitionInfo {
-  name: string;
-  nodes: number;
-  cpus: number;
-  memMb: number;
-  gpuMax: number;
-  gpuTypes: Record<string, number>;
-  isDefault: boolean;
-}
-
-interface ClusterInfo {
-  partitions: PartitionInfo[];
-  defaultPartition?: string;
-  modules?: string[];
-}
-
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -75,6 +66,7 @@ let lastConnectionAlias: string | undefined;
 let previousRemoteSshConfigPath: string | undefined;
 let activeTempSshConfigPath: string | undefined;
 let lastSshAuthPrompt: { identityPath: string; timestamp: number } | undefined;
+let clusterInfoRequestInFlight = false;
 const PROFILE_STORE_KEY = 'sciamaSlurm.profiles';
 const ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
 const PENDING_RESTORE_KEY = 'sciamaSlurm.pendingRestore';
@@ -207,6 +199,8 @@ interface UiValues {
   user: string;
   identityFile: string;
   moduleLoad: string;
+  moduleSelections?: string[];
+  moduleCustomCommand?: string;
   proxyCommand: string;
   proxyArgs: string;
   extraSallocArgs: string;
@@ -371,7 +365,12 @@ async function maybeRestorePendingOnStartup(): Promise<void> {
     await clearPendingRestore();
     return;
   }
-  await delay(500);
+
+  if (pending.openInNewWindow) {
+    await waitForRemoteConnectionOrTimeout(30_000, 500);
+  } else {
+    await delay(500);
+  }
   await restoreRemoteSshConfigIfNeeded();
 }
 
@@ -496,8 +495,24 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'saveProfile': {
-          const rawName = typeof message.name === 'string' ? message.name : '';
-          const name = rawName.trim();
+          const uiValues = message.values as UiValues;
+          const suggestedRaw = typeof message.suggestedName === 'string' ? message.suggestedName : '';
+          const suggestedName = suggestedRaw.trim();
+          const nameInput = await vscode.window.showInputBox({
+            title: 'Profile name',
+            prompt: 'Enter a profile name',
+            value: suggestedName || undefined
+          });
+          if (nameInput === undefined) {
+            webview.postMessage({
+              command: 'profiles',
+              profiles: getProfileSummaries(getProfileStore()),
+              activeProfile: getActiveProfileName(),
+              profileStatus: 'Profile save cancelled.'
+            });
+            break;
+          }
+          const name = nameInput.trim();
           if (!name) {
             webview.postMessage({
               command: 'profiles',
@@ -508,7 +523,6 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             });
             break;
           }
-          const uiValues = message.values as UiValues;
           const store = getProfileStore();
           const existing = store[name];
           const now = new Date().toISOString();
@@ -586,6 +600,20 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             });
             break;
           }
+          const confirmDelete = await vscode.window.showWarningMessage(
+            `Delete profile "${name}"?`,
+            { modal: true },
+            'Delete'
+          );
+          if (confirmDelete !== 'Delete') {
+            webview.postMessage({
+              command: 'profiles',
+              profiles: getProfileSummaries(store),
+              activeProfile: getActiveProfileName(),
+              profileStatus: 'Profile deletion cancelled.'
+            });
+            break;
+          }
           delete store[name];
           if (extensionGlobalState) {
             await extensionGlobalState.update(PROFILE_STORE_KEY, store);
@@ -640,7 +668,7 @@ async function connectCommand(
 
   let didConnect = false;
 
-  const loginHosts = await resolveLoginHosts(cfg);
+  const loginHosts = await resolveLoginHosts(cfg, { interactive });
   log.appendLine(`Login hosts resolved: ${loginHosts.join(', ') || '(none)'}`);
   if (loginHosts.length === 0) {
     void vscode.window.showErrorMessage('No login hosts available. Configure sciamaSlurm.loginHosts or loginHostsCommand.');
@@ -831,9 +859,11 @@ async function connectCommand(
     cfg.remoteWorkspacePath
   );
   didConnect = connected;
-  if (connected) {
+  if (connected && !cfg.openInNewWindow) {
     await delay(500);
     await restoreRemoteSshConfigIfNeeded();
+  } else if (connected && cfg.openInNewWindow) {
+    log.appendLine('Deferring SSH config restore until the remote window is ready.');
   }
   if (!connected) {
     void vscode.window.showWarningMessage(
@@ -850,15 +880,23 @@ async function connectCommand(
   return didConnect;
 }
 
-async function resolveLoginHosts(cfg: SciamaConfig): Promise<string[]> {
+async function resolveLoginHosts(
+  cfg: SciamaConfig,
+  options?: { interactive?: boolean }
+): Promise<string[]> {
+  const interactive = options?.interactive !== false;
+  const log = getOutputChannel();
   let hosts = cfg.loginHosts.slice();
   if (cfg.loginHostsCommand) {
     let queryHost: string | undefined = cfg.loginHostsQueryHost || hosts[0];
-    if (!queryHost) {
+    if (!queryHost && interactive) {
       queryHost = await vscode.window.showInputBox({
         title: 'Login host for discovery',
         prompt: 'Enter a login host to run the loginHostsCommand on.'
       });
+    }
+    if (!queryHost && !interactive) {
+      log.appendLine('Login host discovery skipped (no query host and prompts disabled).');
     }
     if (queryHost) {
       try {
@@ -874,7 +912,7 @@ async function resolveLoginHosts(cfg: SciamaConfig): Promise<string[]> {
   }
 
   hosts = uniqueList(hosts);
-  if (hosts.length === 0) {
+  if (hosts.length === 0 && interactive) {
     const manual = await vscode.window.showInputBox({
       title: 'Login host',
       prompt: 'Enter a login host'
@@ -882,6 +920,9 @@ async function resolveLoginHosts(cfg: SciamaConfig): Promise<string[]> {
     if (manual) {
       hosts = [manual.trim()];
     }
+  }
+  if (hosts.length === 0 && !interactive) {
+    log.appendLine('No login hosts available and prompts are disabled.');
   }
   return hosts;
 }
@@ -939,22 +980,26 @@ async function queryAvailableModules(loginHost: string, cfg: SciamaConfig): Prom
 }
 
 async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webview): Promise<void> {
+  if (clusterInfoRequestInFlight) {
+    return;
+  }
+  clusterInfoRequestInFlight = true;
   const overrides = buildOverridesFromUi(values);
   const cfg = getConfigWithOverrides(overrides);
   const loginHosts = parseListInput(values.loginHosts);
   const log = getOutputChannel();
 
-  if (loginHosts.length === 0) {
-    const message = 'Enter a login host before fetching cluster info.';
-    void vscode.window.showErrorMessage(message);
-    webview.postMessage({ command: 'clusterInfoError', message });
-    return;
-  }
-
-  const loginHost = loginHosts[0];
-  log.appendLine(`Fetching cluster info from ${loginHost}...`);
-
   try {
+    if (loginHosts.length === 0) {
+      const message = 'Enter a login host before fetching cluster info.';
+      void vscode.window.showErrorMessage(message);
+      webview.postMessage({ command: 'clusterInfoError', message });
+      return;
+    }
+
+    const loginHost = loginHosts[0];
+    log.appendLine(`Fetching cluster info from ${loginHost}...`);
+
     const info = await fetchClusterInfo(loginHost, cfg);
     cacheClusterInfo(loginHost, info);
     webview.postMessage({ command: 'clusterInfo', info });
@@ -962,6 +1007,8 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
     const message = formatError(error);
     void vscode.window.showErrorMessage(`Failed to fetch cluster info: ${message}`);
     webview.postMessage({ command: 'clusterInfoError', message });
+  } finally {
+    clusterInfoRequestInFlight = false;
   }
 }
 
@@ -1000,159 +1047,6 @@ async function fetchClusterInfo(loginHost: string, cfg: SciamaConfig): Promise<C
   const modules = await queryAvailableModules(loginHost, cfg);
   info.modules = modules;
   return info;
-}
-
-function hasMeaningfulClusterInfo(info: ClusterInfo): boolean {
-  if (!info.partitions || info.partitions.length === 0) {
-    return false;
-  }
-  return info.partitions.some((partition) =>
-    partition.cpus > 0 || partition.memMb > 0 || partition.gpuMax > 0
-  );
-}
-
-function getMaxFieldCount(output: string): number {
-  const lines = output.split(/\r?\n/).filter((line) => line.trim().length > 0);
-  let max = 0;
-  for (const line of lines) {
-    const count = line.split('|').length;
-    if (count > max) {
-      max = count;
-    }
-  }
-  return max;
-}
-
-function parsePartitionInfoOutput(output: string): ClusterInfo {
-  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const partitions = new Map<string, PartitionInfo>();
-  const nodeSets = new Map<string, Set<string>>();
-  let defaultPartition: string | undefined;
-
-  for (const line of lines) {
-    const fields = line.split('|').map((value) => value.trim());
-    if (fields.length < 3) {
-      continue;
-    }
-    const rawName = fields[0];
-    const field1 = fields[1] || '';
-    const field2 = fields[2] || '';
-    const field3 = fields[3] || '';
-    const field4 = fields[4] || '';
-    if (!rawName) {
-      continue;
-    }
-
-    const isField1Numeric = /^\d/.test(field1);
-    const nodeName = !isField1Numeric && field1 ? field1 : undefined;
-    const nodesCount = isField1Numeric ? parseNumericField(field1) : 0;
-    const cpusRaw = field2;
-    const memRaw = field3;
-    const gresRaw = field4;
-    const cpus = parseNumericField(cpusRaw.includes('/') ? cpusRaw.split('/').pop() || '' : cpusRaw);
-    const memMb = parseNumericField(memRaw);
-    const gresInfo = parseGresInfo(gresRaw || '');
-
-    const partitionNames = rawName.split(',').map((part) => part.trim()).filter(Boolean);
-    for (const partitionName of partitionNames) {
-      const isDefault = partitionName.includes('*');
-      const name = partitionName.replace(/\*/g, '');
-      if (isDefault && !defaultPartition) {
-        defaultPartition = name;
-      }
-
-      const existing = partitions.get(name) || {
-        name,
-        nodes: 0,
-        cpus: 0,
-        memMb: 0,
-        gpuMax: 0,
-        gpuTypes: {},
-        isDefault
-      };
-
-      if (nodeName) {
-        if (!nodeSets.has(name)) {
-          nodeSets.set(name, new Set());
-        }
-        nodeSets.get(name)?.add(nodeName);
-      } else if (nodesCount) {
-        existing.nodes = Math.max(existing.nodes, nodesCount);
-      }
-
-      existing.cpus = Math.max(existing.cpus, cpus);
-      existing.memMb = Math.max(existing.memMb, memMb);
-      existing.gpuMax = Math.max(existing.gpuMax, gresInfo.gpuMax);
-      for (const [type, count] of Object.entries(gresInfo.gpuTypes)) {
-        const current = existing.gpuTypes[type] || 0;
-        existing.gpuTypes[type] = Math.max(current, count);
-      }
-      existing.isDefault = existing.isDefault || isDefault;
-
-      partitions.set(name, existing);
-    }
-  }
-
-  for (const [name, info] of partitions) {
-    const set = nodeSets.get(name);
-    if (set && set.size > 0) {
-      info.nodes = set.size;
-    }
-  }
-
-  const list = Array.from(partitions.values()).sort((a, b) => a.name.localeCompare(b.name));
-  return { partitions: list, defaultPartition };
-}
-
-function parseGresInfo(raw: string): { gpuMax: number; gpuTypes: Record<string, number> } {
-  const result: { gpuMax: number; gpuTypes: Record<string, number> } = {
-    gpuMax: 0,
-    gpuTypes: {}
-  };
-  if (!raw) {
-    return result;
-  }
-  const tokens = raw.split(',').map((token) => token.trim()).filter(Boolean);
-  for (const token of tokens) {
-    if (!token.includes('gpu')) {
-      continue;
-    }
-    const cleaned = token.replace(/\(.*?\)/g, '');
-    const parts = cleaned.split(':').map((part) => part.trim()).filter(Boolean);
-    if (parts.length === 0 || parts[0] !== 'gpu') {
-      continue;
-    }
-    let type = '';
-    let count = 0;
-    if (parts.length === 2) {
-      if (/^\d+$/.test(parts[1])) {
-        count = Number(parts[1]);
-      } else {
-        type = parts[1];
-      }
-    } else if (parts.length >= 3) {
-      type = parts[1];
-      if (/^\d+$/.test(parts[2])) {
-        count = Number(parts[2]);
-      }
-    }
-    if (count <= 0) {
-      continue;
-    }
-    result.gpuMax = Math.max(result.gpuMax, count);
-    const key = type || '';
-    const existing = result.gpuTypes[key] || 0;
-    result.gpuTypes[key] = Math.max(existing, count);
-  }
-  return result;
-}
-
-function parseNumericField(value: string): number {
-  const match = value.match(/\d+/);
-  if (!match) {
-    return 0;
-  }
-  return Number(match[0]) || 0;
 }
 
 
@@ -1195,58 +1089,115 @@ function looksLikeAuthFailure(text: string): boolean {
   ].some((pattern) => pattern.test(text));
 }
 
-
-async function ensureAskpassScript(): Promise<string> {
-  const baseDir = extensionStoragePath || os.tmpdir();
-  const scriptPath = path.join(baseDir, 'sciama-ssh-askpass.sh');
-  try {
-    await fs.access(scriptPath);
-    return scriptPath;
-  } catch {
-    // continue to (re)create
+async function getPublicKeyFingerprint(identityPath: string): Promise<string | undefined> {
+  if (!identityPath) {
+    return undefined;
   }
-  const script = ['#!/bin/sh', 'printf "%s\n" "${SCIAMA_SSH_PASSPHRASE:-}"', ''].join('\n');
-  await fs.mkdir(path.dirname(scriptPath), { recursive: true });
-  await fs.writeFile(scriptPath, script, { mode: 0o700 });
-  await fs.chmod(scriptPath, 0o700);
-  return scriptPath;
+  const pubPath = identityPath.endsWith('.pub') ? identityPath : `${identityPath}.pub`;
+  try {
+    await fs.access(pubPath);
+  } catch {
+    return undefined;
+  }
+  try {
+    const { stdout } = await execFileAsync('ssh-keygen', ['-lf', pubPath, '-E', 'sha256']);
+    const match = stdout.match(/SHA256:[A-Za-z0-9+/=]+/);
+    return match ? match[0] : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-async function addKeyToAgent(identityPath: string): Promise<boolean> {
-  const passphrase = await vscode.window.showInputBox({
-    title: 'SSH key passphrase',
-    prompt: `Enter the passphrase for ${identityPath} (leave blank if none)`,
-    password: true,
-    ignoreFocusOut: true
-  });
-  if (passphrase === undefined) {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function isSshKeyLoaded(identityPath: string): Promise<boolean> {
+  if (!identityPath) {
     return false;
   }
-  const askpassPath = await ensureAskpassScript();
-  const env = {
-    ...process.env,
-    SCIAMA_SSH_PASSPHRASE: passphrase,
-    SSH_ASKPASS: askpassPath,
-    SSH_ASKPASS_REQUIRE: 'force',
-    DISPLAY: process.env.DISPLAY || '1'
-  };
-  const log = getOutputChannel();
+  let output = '';
   try {
-    log.appendLine(`Running ssh-add for ${identityPath}.`);
-    const { stderr } = await execFileAsync('ssh-add', [identityPath], { env, timeout: 15000 });
-    if (stderr && stderr.trim().length > 0) {
-      log.appendLine(stderr.trim());
-    }
-    void vscode.window.showInformationMessage('SSH key added to agent.');
-    return true;
+    const result = await execFileAsync('ssh-add', ['-l']);
+    output = [result.stdout, result.stderr].filter(Boolean).join('\n');
   } catch (error) {
     const errorText = normalizeSshErrorText(error);
-    const summary = pickSshErrorSummary(errorText) || 'SSH key add failed.';
-    log.appendLine(`ssh-add failed: ${summary}`);
-    void vscode.window.showWarningMessage(`Failed to add SSH key: ${summary}`);
+    if (/no identities/i.test(errorText)) {
+      return false;
+    }
     return false;
   }
+  if (!output.trim()) {
+    return false;
+  }
+  if (/no identities/i.test(output)) {
+    return false;
+  }
+
+  const fingerprint = await getPublicKeyFingerprint(identityPath);
+  if (fingerprint) {
+    const pattern = new RegExp(escapeRegExp(fingerprint));
+    if (pattern.test(output)) {
+      return true;
+    }
+  }
+  const basename = path.basename(identityPath);
+  if (basename && output.includes(basename)) {
+    return true;
+  }
+  if (output.includes(identityPath)) {
+    return true;
+  }
   return false;
+}
+
+
+function buildTerminalSshAddCommand(identityPath: string): string {
+  const trimmed = identityPath.trim();
+  if (!trimmed) {
+    return 'ssh-add';
+  }
+  if (!/[\s"]/g.test(trimmed)) {
+    return `ssh-add ${trimmed}`;
+  }
+  const escaped = trimmed.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return `ssh-add "${escaped}"`;
+}
+
+function openSshAddTerminal(identityPath: string): vscode.Terminal {
+  const terminal = vscode.window.createTerminal({ name: 'Sciama SSH Add' });
+  terminal.show(true);
+  const command = buildTerminalSshAddCommand(identityPath);
+  terminal.sendText(command, true);
+  void vscode.window.showInformationMessage('Follow the terminal prompt to add your SSH key.');
+  return terminal;
+}
+
+async function waitForSshKeyLoaded(
+  identityPath: string,
+  timeoutMs: number,
+  pollMs: number
+): Promise<boolean> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await isSshKeyLoaded(identityPath)) {
+      return true;
+    }
+    await delay(pollMs);
+  }
+  return await isSshKeyLoaded(identityPath);
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  if (!filePath) {
+    return false;
+  }
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function maybePromptForSshAuth(cfg: SciamaConfig, errorText: string): Promise<boolean> {
@@ -1254,6 +1205,10 @@ async function maybePromptForSshAuth(cfg: SciamaConfig, errorText: string): Prom
     return false;
   }
   const identityPath = cfg.identityFile ? expandHome(cfg.identityFile) : '';
+  const identityExists = identityPath ? await fileExists(identityPath) : false;
+  if (identityPath && identityExists && await isSshKeyLoaded(identityPath)) {
+    return false;
+  }
   const now = Date.now();
   if (lastSshAuthPrompt) {
     const sameIdentity = lastSshAuthPrompt.identityPath === identityPath;
@@ -1265,16 +1220,37 @@ async function maybePromptForSshAuth(cfg: SciamaConfig, errorText: string): Prom
   lastSshAuthPrompt = { identityPath, timestamp: now };
 
   const actions: string[] = [];
-  if (identityPath) {
-    actions.push('Add key to agent');
+  if (identityPath && identityExists) {
+    actions.push('Open Terminal');
   }
-  actions.push('Open Settings', 'Dismiss');
-  const message = identityPath
-    ? `SSH authentication failed while querying the cluster. Add ${identityPath} to your ssh-agent or update sciamaSlurm.identityFile.`
-    : 'SSH authentication failed while querying the cluster. Add your key to the ssh-agent (ssh-add <key>) or set sciamaSlurm.identityFile.';
-  const choice = await vscode.window.showWarningMessage(message, ...actions);
-  if (choice === 'Add key to agent' && identityPath) {
-    return await addKeyToAgent(identityPath);
+  if (!identityPath || !identityExists) {
+    actions.push('Open Settings');
+  }
+  actions.push('Dismiss');
+  const message = identityPath && !identityExists
+    ? `SSH authentication failed while querying the cluster. The identity file ${identityPath} was not found. Update sciamaSlurm.identityFile to a valid key.`
+    : identityPath
+      ? `SSH authentication failed while querying the cluster. Add ${identityPath} to your ssh-agent.`
+      : 'SSH authentication failed while querying the cluster. Add your key to the ssh-agent (ssh-add <key>) or set sciamaSlurm.identityFile.';
+  const choice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
+  if (choice === 'Open Terminal' && identityPath) {
+    const terminal = openSshAddTerminal(identityPath);
+    const loaded = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: 'Waiting for ssh-add to load the key',
+        cancellable: false
+      },
+      async () => await waitForSshKeyLoaded(identityPath, 180_000, 1500)
+    );
+    if (loaded) {
+      terminal.dispose();
+      return true;
+    }
+    void vscode.window.showInformationMessage(
+      'SSH key not detected in agent yet. Re-run Get cluster info after ssh-add completes.'
+    );
+    return false;
   }
   if (choice === 'Open Settings') {
     void vscode.commands.executeCommand('workbench.action.openSettings', 'sciamaSlurm.identityFile');
@@ -1530,36 +1506,6 @@ function buildDefaultAlias(
   return pieces.join('-').replace(/[^a-zA-Z0-9_-]/g, '-');
 }
 
-function buildHostEntry(alias: string, loginHost: string, cfg: SciamaConfig, remoteCommand: string): string {
-  const lines: string[] = [];
-  lines.push(`# Generated by Sciama Slurm Connect on ${new Date().toISOString()}`);
-  lines.push(`Host ${alias}`);
-  lines.push(`  HostName ${loginHost}`);
-  if (cfg.user) {
-    lines.push(`  User ${cfg.user}`);
-  }
-  if (cfg.requestTTY) {
-    lines.push('  RequestTTY yes');
-  }
-  if (cfg.forwardAgent) {
-    lines.push('  ForwardAgent yes');
-  }
-  if (cfg.identityFile) {
-    lines.push(`  IdentityFile ${cfg.identityFile}`);
-  }
-  lines.push(`  RemoteCommand ${remoteCommand}`);
-
-  const extraKeys = Object.keys(cfg.additionalSshOptions || {}).sort();
-  for (const key of extraKeys) {
-    const value = cfg.additionalSshOptions[key];
-    if (value !== undefined && value !== null && String(value).length > 0) {
-      lines.push(`  ${key} ${value}`);
-    }
-  }
-
-  return `${lines.join('\n')}\n`;
-}
-
 async function writeTemporarySshConfig(
   entry: string,
   cfg: SciamaConfig,
@@ -1576,12 +1522,7 @@ async function writeTemporarySshConfig(
     .filter(Boolean)
     .map((value) => expandHome(value))
     .filter((value) => value && path.resolve(value) !== resolvedBase);
-  const includeLines = includes.map((value) => `Include ${value}`);
-  const contentLines = ['# Temporary SSH config generated by Sciama Slurm Connect', entry.trimEnd()];
-  if (includeLines.length > 0) {
-    contentLines.push('', ...includeLines);
-  }
-  const content = `${contentLines.join('\n')}\n`;
+  const content = buildTemporarySshConfigContent(entry, includes);
   await fs.writeFile(basePath, content, 'utf8');
   return basePath;
 }
@@ -1839,6 +1780,26 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
 }
 
 function getUiValuesFromConfig(cfg: SciamaConfig): UiValues {
+  const config = vscode.workspace.getConfiguration('sciamaSlurm');
+  const hasValue = (key: string): boolean => {
+    const inspected = config.inspect(key);
+    if (!inspected) {
+      return false;
+    }
+    return (
+      inspected.workspaceFolderValue !== undefined ||
+      inspected.workspaceValue !== undefined ||
+      inspected.globalValue !== undefined
+    );
+  };
+  const hasDefaultPartition = hasValue('defaultPartition');
+  const hasDefaultNodes = hasValue('defaultNodes');
+  const hasDefaultTasksPerNode = hasValue('defaultTasksPerNode');
+  const hasDefaultCpusPerTask = hasValue('defaultCpusPerTask');
+  const hasDefaultTime = hasValue('defaultTime');
+  const hasDefaultMemoryMb = hasValue('defaultMemoryMb');
+  const hasDefaultGpuType = hasValue('defaultGpuType');
+  const hasDefaultGpuCount = hasValue('defaultGpuCount');
   return {
     loginHosts: cfg.loginHosts.join('\n'),
     loginHostsCommand: cfg.loginHostsCommand || '',
@@ -1854,14 +1815,14 @@ function getUiValuesFromConfig(cfg: SciamaConfig): UiValues {
     proxyArgs: cfg.proxyArgs.join('\n'),
     extraSallocArgs: cfg.extraSallocArgs.join('\n'),
     promptForExtraSallocArgs: cfg.promptForExtraSallocArgs,
-    defaultPartition: cfg.defaultPartition || '',
-    defaultNodes: String(cfg.defaultNodes),
-    defaultTasksPerNode: String(cfg.defaultTasksPerNode),
-    defaultCpusPerTask: String(cfg.defaultCpusPerTask),
-    defaultTime: cfg.defaultTime || '',
-    defaultMemoryMb: cfg.defaultMemoryMb ? String(cfg.defaultMemoryMb) : '',
-    defaultGpuType: cfg.defaultGpuType || '',
-    defaultGpuCount: cfg.defaultGpuCount ? String(cfg.defaultGpuCount) : '',
+    defaultPartition: hasDefaultPartition ? (cfg.defaultPartition || '') : '',
+    defaultNodes: hasDefaultNodes && cfg.defaultNodes ? String(cfg.defaultNodes) : '',
+    defaultTasksPerNode: hasDefaultTasksPerNode && cfg.defaultTasksPerNode ? String(cfg.defaultTasksPerNode) : '',
+    defaultCpusPerTask: hasDefaultCpusPerTask && cfg.defaultCpusPerTask ? String(cfg.defaultCpusPerTask) : '',
+    defaultTime: hasDefaultTime ? (cfg.defaultTime || '') : '',
+    defaultMemoryMb: hasDefaultMemoryMb && cfg.defaultMemoryMb ? String(cfg.defaultMemoryMb) : '',
+    defaultGpuType: hasDefaultGpuType ? (cfg.defaultGpuType || '') : '',
+    defaultGpuCount: hasDefaultGpuCount && cfg.defaultGpuCount ? String(cfg.defaultGpuCount) : '',
     sshHostPrefix: cfg.sshHostPrefix || '',
     forwardAgent: cfg.forwardAgent,
     requestTTY: cfg.requestTTY,
@@ -1914,16 +1875,6 @@ async function updateConfigFromUi(values: UiValues, target: vscode.Configuration
   }
 }
 
-function expandHome(input: string): string {
-  if (!input) {
-    return input;
-  }
-  if (input.startsWith('~')) {
-    return path.join(os.homedir(), input.slice(1));
-  }
-  return input;
-}
-
 function uniqueList(values: string[]): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
@@ -1942,6 +1893,17 @@ function splitArgs(input: string): string[] {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForRemoteConnectionOrTimeout(timeoutMs: number, pollMs: number): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (vscode.env.remoteName === 'ssh-remote') {
+      return true;
+    }
+    await delay(pollMs);
+  }
+  return vscode.env.remoteName === 'ssh-remote';
 }
 
 function parseListInput(input: string): string[] {
@@ -2077,12 +2039,27 @@ function getWebviewHtml(webview: vscode.Webview): string {
     details summary { cursor: pointer; margin-bottom: 6px; color: var(--vscode-foreground); }
     .module-row { align-items: center; }
     .row > .module-actions { flex: 0 0 auto; }
-    .row > .module-picker { flex: 1; }
+    .row > .combo-picker { flex: 1; }
     .module-actions button { width: auto; min-width: 32px; }
     .module-list { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
-    .module-picker { position: relative; }
-    .module-toggle { width: auto; min-width: 28px; padding: 0 6px; }
-    .module-menu {
+    .combo-picker { position: relative; }
+    .combo-picker::after {
+      content: '';
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      width: 0;
+      height: 0;
+      border-left: 4px solid transparent;
+      border-right: 4px solid transparent;
+      border-top: 6px solid var(--vscode-descriptionForeground);
+      opacity: 0.7;
+      transform: translateY(-50%);
+      pointer-events: none;
+    }
+    .combo-picker.no-options::after { display: none; }
+    .combo-picker input { padding-right: 22px; }
+    .dropdown-menu {
       position: absolute;
       top: calc(100% + 2px);
       left: 0;
@@ -2095,12 +2072,12 @@ function getWebviewHtml(webview: vscode.Webview): string {
       z-index: 5;
       display: none;
     }
-    .module-menu.visible { display: block; }
-    .module-option {
+    .dropdown-menu.visible { display: block; }
+    .dropdown-option {
       padding: 4px 6px;
       cursor: pointer;
     }
-    .module-option:hover {
+    .dropdown-option:hover {
       background: var(--vscode-list-hoverBackground, var(--vscode-button-hoverBackground));
     }
     .module-item {
@@ -2137,8 +2114,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <summary>Profiles</summary>
     <label for="profileSelect">Saved profiles</label>
     <select id="profileSelect"></select>
-    <label for="profileName">Profile name</label>
-    <input id="profileName" type="text" placeholder="e.g. gpu-a100" />
     <div class="buttons" style="margin-top: 8px;">
       <button id="profileLoad">Load</button>
       <button id="profileSave">Save profile</button>
@@ -2149,16 +2124,18 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
   <div class="section">
     <label for="defaultPartitionInput">Partition</label>
-    <select id="defaultPartitionSelect" class="hidden"></select>
-    <input id="defaultPartitionInput" type="text" list="partitionOptions" placeholder="(optional)" />
-    <datalist id="partitionOptions"></datalist>
+    <div class="combo-picker" id="defaultPartitionPicker">
+      <input id="defaultPartitionInput" type="text" placeholder="(optional)" />
+      <div id="defaultPartitionMenu" class="dropdown-menu"></div>
+    </div>
     <div id="partitionMeta" class="hint"></div>
     <div class="row">
       <div>
         <label for="defaultNodesInput">Nodes</label>
-        <select id="defaultNodesSelect" class="hidden"></select>
-        <input id="defaultNodesInput" type="number" min="1" list="nodesOptions" />
-        <datalist id="nodesOptions"></datalist>
+        <div class="combo-picker" id="defaultNodesPicker">
+          <input id="defaultNodesInput" type="number" min="1" />
+          <div id="defaultNodesMenu" class="dropdown-menu"></div>
+        </div>
       </div>
       <div>
         <label for="defaultTasksPerNode">Tasks per node</label>
@@ -2168,44 +2145,48 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <div class="row">
       <div>
         <label for="defaultCpusPerTaskInput">CPUs per task</label>
-        <select id="defaultCpusPerTaskSelect" class="hidden"></select>
-        <input id="defaultCpusPerTaskInput" type="number" min="1" list="cpusOptions" />
-        <datalist id="cpusOptions"></datalist>
+        <div class="combo-picker" id="defaultCpusPerTaskPicker">
+          <input id="defaultCpusPerTaskInput" type="number" min="1" />
+          <div id="defaultCpusPerTaskMenu" class="dropdown-menu"></div>
+        </div>
       </div>
       <div>
         <label for="defaultMemoryMbInput">Memory per node</label>
-        <select id="defaultMemoryMbSelect" class="hidden"></select>
-        <input id="defaultMemoryMbInput" type="number" min="0" list="memoryOptions" placeholder="MB (optional)" />
-        <datalist id="memoryOptions"></datalist>
+        <div class="combo-picker" id="defaultMemoryMbPicker">
+          <input id="defaultMemoryMbInput" type="number" min="0" placeholder="MB (optional)" />
+          <div id="defaultMemoryMbMenu" class="dropdown-menu"></div>
+        </div>
       </div>
     </div>
     <div class="row">
       <div>
         <label for="defaultGpuTypeInput">GPU type</label>
-        <select id="defaultGpuTypeSelect" class="hidden"></select>
-        <input id="defaultGpuTypeInput" type="text" list="gpuTypeOptions" placeholder="Any" />
-        <datalist id="gpuTypeOptions"></datalist>
+        <div class="combo-picker" id="defaultGpuTypePicker">
+          <input id="defaultGpuTypeInput" type="text" placeholder="Any" />
+          <div id="defaultGpuTypeMenu" class="dropdown-menu"></div>
+        </div>
       </div>
       <div>
         <label for="defaultGpuCountInput">GPU count</label>
-        <select id="defaultGpuCountSelect" class="hidden"></select>
-        <input id="defaultGpuCountInput" type="number" min="0" list="gpuCountOptions" />
-        <datalist id="gpuCountOptions"></datalist>
+        <div class="combo-picker" id="defaultGpuCountPicker">
+          <input id="defaultGpuCountInput" type="number" min="0" />
+          <div id="defaultGpuCountMenu" class="dropdown-menu"></div>
+        </div>
       </div>
     </div>
     <label for="defaultTime">Wall time</label>
     <input id="defaultTime" type="text" />
+    <div class="buttons" style="margin-top: 8px;">
+      <button id="clearResources" type="button">Clear resources</button>
+    </div>
   </div>
 
   <div class="section">
     <label for="moduleInput">Modules</label>
     <div class="row module-row">
-      <div class="module-picker">
+      <div class="combo-picker" id="modulePicker">
         <input id="moduleInput" type="text" placeholder="Type module(s) or pick from the list" />
-        <div id="moduleMenu" class="module-menu"></div>
-      </div>
-      <div class="module-actions">
-        <button id="moduleToggle" class="module-toggle" type="button" aria-label="Show modules">v</button>
+        <div id="moduleMenu" class="dropdown-menu"></div>
       </div>
       <div class="module-actions">
         <button id="moduleAdd" type="button">+</button>
@@ -2294,7 +2275,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     let clusterInfo = null;
-    let clusterMode = false;
     let lastValues = {};
     let connectionState = 'idle';
     let availableModules = [];
@@ -2302,12 +2282,42 @@ function getWebviewHtml(webview: vscode.Webview): string {
     let customModuleCommand = '';
 
     const resourceFields = {
-      defaultPartition: { select: 'defaultPartitionSelect', input: 'defaultPartitionInput', list: 'partitionOptions' },
-      defaultNodes: { select: 'defaultNodesSelect', input: 'defaultNodesInput', list: 'nodesOptions' },
-      defaultCpusPerTask: { select: 'defaultCpusPerTaskSelect', input: 'defaultCpusPerTaskInput', list: 'cpusOptions' },
-      defaultMemoryMb: { select: 'defaultMemoryMbSelect', input: 'defaultMemoryMbInput', list: 'memoryOptions' },
-      defaultGpuType: { select: 'defaultGpuTypeSelect', input: 'defaultGpuTypeInput', list: 'gpuTypeOptions' },
-      defaultGpuCount: { select: 'defaultGpuCountSelect', input: 'defaultGpuCountInput', list: 'gpuCountOptions' }
+      defaultPartition: {
+        input: 'defaultPartitionInput',
+        menu: 'defaultPartitionMenu',
+        picker: 'defaultPartitionPicker',
+        options: []
+      },
+      defaultNodes: {
+        input: 'defaultNodesInput',
+        menu: 'defaultNodesMenu',
+        picker: 'defaultNodesPicker',
+        options: []
+      },
+      defaultCpusPerTask: {
+        input: 'defaultCpusPerTaskInput',
+        menu: 'defaultCpusPerTaskMenu',
+        picker: 'defaultCpusPerTaskPicker',
+        options: []
+      },
+      defaultMemoryMb: {
+        input: 'defaultMemoryMbInput',
+        menu: 'defaultMemoryMbMenu',
+        picker: 'defaultMemoryMbPicker',
+        options: []
+      },
+      defaultGpuType: {
+        input: 'defaultGpuTypeInput',
+        menu: 'defaultGpuTypeMenu',
+        picker: 'defaultGpuTypePicker',
+        options: []
+      },
+      defaultGpuCount: {
+        input: 'defaultGpuCountInput',
+        menu: 'defaultGpuCountMenu',
+        picker: 'defaultGpuCountPicker',
+        options: []
+      }
     };
 
     function setStatus(text, isError) {
@@ -2373,16 +2383,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
       } else {
         select.value = items[0].name;
       }
-      const nameInput = document.getElementById('profileName');
-      if (nameInput && select.value) {
-        nameInput.value = select.value;
-      }
-    }
-
-    function getProfileNameInput() {
-      const input = document.getElementById('profileName');
-      if (!input) return '';
-      return input.value.trim();
     }
 
     function getSelectedProfileName() {
@@ -2401,72 +2401,168 @@ function getWebviewHtml(webview: vscode.Webview): string {
       return mb + ' MB';
     }
 
-    function setSelectOptions(selectId, options, selectedValue) {
-      const select = document.getElementById(selectId);
-      if (!select) return;
-      select.innerHTML = '';
-      options.forEach((opt) => {
-        const option = document.createElement('option');
-        option.value = String(opt.value);
-        option.textContent = opt.label;
-        select.appendChild(option);
+    function normalizeOptions(options) {
+      const items = Array.isArray(options) ? options : [];
+      return items.map((opt) => {
+        const value = opt && opt.value !== undefined && opt.value !== null ? String(opt.value) : '';
+        const label = opt && opt.label !== undefined ? String(opt.label) : String(value);
+        return { value, label };
       });
-      if (selectedValue !== undefined && selectedValue !== null && selectedValue !== '') {
-        const desired = String(selectedValue);
-        if (Array.from(select.options).some((opt) => opt.value === desired)) {
-          select.value = desired;
-        }
-      }
-      if (!select.value && select.options.length > 0) {
-        select.value = select.options[0].value;
-      }
-    }
-
-    function setInputOptions(inputId, listId, options, selectedValue) {
-      const input = document.getElementById(inputId);
-      const list = document.getElementById(listId);
-      if (!input || !list) return;
-      list.innerHTML = '';
-      options.forEach((opt) => {
-        const option = document.createElement('option');
-        const value = opt.value === undefined || opt.value === null ? '' : opt.value;
-        option.value = String(value);
-        option.textContent = opt.label ?? String(value);
-        list.appendChild(option);
-      });
-      const current = input.value;
-      if (selectedValue !== undefined && selectedValue !== null && selectedValue !== '') {
-        input.value = String(selectedValue);
-      } else if (!current && options.length > 0) {
-        input.value = String(options[0].value ?? '');
-      }
     }
 
     function setFieldOptions(fieldKey, options, selectedValue) {
       const field = resourceFields[fieldKey];
       if (!field) return;
-      setSelectOptions(field.select, options, selectedValue);
-      setInputOptions(field.input, field.list, options, selectedValue);
-    }
-
-    function clearDatalist(listId) {
-      const list = document.getElementById(listId);
-      if (list) list.innerHTML = '';
-    }
-
-    function clearResourceLists() {
-      Object.values(resourceFields).forEach((field) => {
-        if (field.list) {
-          clearDatalist(field.list);
+      const normalized = normalizeOptions(options);
+      field.options = normalized;
+      const input = document.getElementById(field.input);
+      if (input) {
+        const current = input.value;
+        if (selectedValue !== undefined && selectedValue !== null && selectedValue !== '') {
+          input.value = String(selectedValue);
         }
+      }
+      const picker = document.getElementById(field.picker);
+      if (picker) {
+        if (normalized.length === 0) {
+          picker.classList.add('no-options');
+        } else {
+          picker.classList.remove('no-options');
+        }
+      }
+      const menu = document.getElementById(field.menu);
+      if (menu && menu.classList.contains('visible')) {
+        showFieldMenu(fieldKey, false, false);
+      }
+    }
+
+    function filterFieldOptions(fieldKey, filterText) {
+      const field = resourceFields[fieldKey];
+      if (!field) return [];
+      const text = String(filterText || '').trim().toLowerCase();
+      if (!text) {
+        return field.options.slice();
+      }
+      return field.options.filter((opt) =>
+        opt.label.toLowerCase().includes(text) || opt.value.toLowerCase().includes(text)
+      );
+    }
+
+    function renderFieldMenu(fieldKey, options) {
+      const field = resourceFields[fieldKey];
+      if (!field) return;
+      const menu = document.getElementById(field.menu);
+      if (!menu) return;
+      menu.innerHTML = '';
+      const items = Array.isArray(options) ? options : [];
+      if (items.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'dropdown-option';
+        empty.textContent = field.options.length ? 'No matches' : 'No options';
+        menu.appendChild(empty);
+        return;
+      }
+      items.forEach((opt) => {
+        const option = document.createElement('div');
+        option.className = 'dropdown-option';
+        option.textContent = opt.label;
+        option.addEventListener('mousedown', (event) => {
+          event.preventDefault();
+          const input = document.getElementById(field.input);
+          if (input) {
+            input.value = opt.value;
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          hideFieldMenu(fieldKey);
+        });
+        menu.appendChild(option);
       });
     }
 
+    function showFieldMenu(fieldKey, showAll, closeOthers = true) {
+      const field = resourceFields[fieldKey];
+      if (!field || field.options.length === 0) return;
+      const menu = document.getElementById(field.menu);
+      const input = document.getElementById(field.input);
+      if (!menu || !input) return;
+      if (closeOthers) {
+        closeAllMenus();
+      }
+      const options = showAll ? field.options : filterFieldOptions(fieldKey, input.value);
+      renderFieldMenu(fieldKey, options);
+      menu.classList.add('visible');
+    }
+
+    function hideFieldMenu(fieldKey) {
+      const field = resourceFields[fieldKey];
+      if (!field) return;
+      const menu = document.getElementById(field.menu);
+      if (menu) {
+        menu.classList.remove('visible');
+      }
+    }
+
+    function closeAllMenus() {
+      hideModuleMenu();
+      Object.keys(resourceFields).forEach((key) => hideFieldMenu(key));
+    }
+
+    function clearResourceOptions() {
+      Object.keys(resourceFields).forEach((key) => {
+        const field = resourceFields[key];
+        field.options = [];
+        const picker = document.getElementById(field.picker);
+        if (picker) {
+          picker.classList.add('no-options');
+        }
+        hideFieldMenu(key);
+      });
+    }
+
+    function normalizeModuleName(value) {
+      return String(value || '').replace(/\s+/g, '');
+    }
+
+    function coalesceModuleTokens(tokens) {
+      if (!Array.isArray(tokens) || tokens.length < 2 || availableModules.length === 0) {
+        return tokens;
+      }
+      const normalizedMap = new Map();
+      availableModules.forEach((name) => {
+        normalizedMap.set(normalizeModuleName(name), name);
+      });
+      const result = [];
+      for (let i = 0; i < tokens.length; i += 1) {
+        let combined = tokens[i];
+        let matched = normalizedMap.get(normalizeModuleName(combined));
+        if (matched) {
+          result.push(matched);
+          continue;
+        }
+        let found = false;
+        for (let j = i + 1; j < tokens.length; j += 1) {
+          combined += tokens[j];
+          matched = normalizedMap.get(normalizeModuleName(combined));
+          if (matched) {
+            result.push(matched);
+            i = j;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          result.push(tokens[i]);
+        }
+      }
+      return result;
+    }
+
     function parseModuleList(input) {
-      return String(input || '')
+      const tokens = String(input || '')
         .split(/[\s,]+/)
         .map((value) => value.trim())
         .filter(Boolean);
+      return coalesceModuleTokens(tokens);
     }
 
     function updateModuleHint() {
@@ -2480,7 +2576,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         hint.textContent = 'No module list available. Type module names below.';
         return;
       }
-      hint.textContent = availableModules.length + ' modules available. Click the dropdown button or type to filter.';
+      hint.textContent = availableModules.length + ' modules available. Click the field or type to filter.';
     }
 
     function syncModuleLoadValue() {
@@ -2533,12 +2629,35 @@ function getWebviewHtml(webview: vscode.Webview): string {
       renderModuleList();
     }
 
+    function applyModuleState(values) {
+      const selections = Array.isArray(values.moduleSelections)
+        ? values.moduleSelections.filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
+        : [];
+      const custom = typeof values.moduleCustomCommand === 'string' ? values.moduleCustomCommand.trim() : '';
+      if (selections.length > 0) {
+        selectedModules = selections.map((entry) => entry.trim()).filter(Boolean);
+        customModuleCommand = '';
+        renderModuleList();
+        return;
+      }
+      if (custom) {
+        selectedModules = [];
+        customModuleCommand = custom;
+        renderModuleList();
+        return;
+      }
+      applyModuleLoad(values.moduleLoad);
+    }
+
     function setModuleOptions(modules) {
       const list = Array.isArray(modules) ? modules : [];
       availableModules = list.slice();
-      const toggle = document.getElementById('moduleToggle');
-      if (toggle) {
-        toggle.disabled = availableModules.length === 0;
+      const picker = document.getElementById('modulePicker');
+      if (availableModules.length === 0) {
+        hideModuleMenu();
+        if (picker) picker.classList.add('no-options');
+      } else if (picker) {
+        picker.classList.remove('no-options');
       }
       updateModuleHint();
     }
@@ -2558,14 +2677,14 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const items = Array.isArray(options) ? options : [];
       if (items.length === 0) {
         const empty = document.createElement('div');
-        empty.className = 'module-option';
+        empty.className = 'dropdown-option';
         empty.textContent = availableModules.length ? 'No matches' : 'No modules available';
         menu.appendChild(empty);
         return;
       }
       items.forEach((moduleName) => {
         const option = document.createElement('div');
-        option.className = 'module-option';
+        option.className = 'dropdown-option';
         option.textContent = moduleName;
         option.addEventListener('mousedown', (event) => {
           event.preventDefault();
@@ -2580,10 +2699,13 @@ function getWebviewHtml(webview: vscode.Webview): string {
       });
     }
 
-    function showModuleMenu(showAll) {
+    function showModuleMenu(showAll, closeOthers = true) {
       const menu = document.getElementById('moduleMenu');
       const input = document.getElementById('moduleInput');
       if (!menu || !input || availableModules.length === 0) return;
+      if (closeOthers) {
+        closeAllMenus();
+      }
       const options = showAll ? availableModules.slice() : filterModules(input.value);
       renderModuleMenu(options);
       menu.classList.add('visible');
@@ -2616,41 +2738,27 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (input) input.value = '';
     }
 
-    function setClusterMode(enabled) {
-      clusterMode = enabled;
-      Object.values(resourceFields).forEach((field) => {
-        const select = document.getElementById(field.select);
-        const input = document.getElementById(field.input);
-        if (!select || !input) return;
-        if (enabled) {
-          if (input.value) {
-            select.value = input.value;
-          }
-          select.classList.remove('hidden');
-          input.classList.add('hidden');
-        } else {
-          if (select.value) {
-            input.value = select.value;
-          }
-          input.classList.remove('hidden');
-          select.classList.add('hidden');
-        }
-      });
-    }
-
     function setFieldDisabled(fieldKey, disabled) {
       const field = resourceFields[fieldKey];
       if (!field) return;
-      const select = document.getElementById(field.select);
       const input = document.getElementById(field.input);
-      if (select) select.disabled = disabled;
       if (input) input.disabled = disabled;
+      const picker = document.getElementById(field.picker);
+      if (picker) {
+        if (disabled || field.options.length === 0) {
+          picker.classList.add('no-options');
+        } else {
+          picker.classList.remove('no-options');
+        }
+      }
+      if (disabled) {
+        hideFieldMenu(fieldKey);
+      }
     }
 
     function setResourceDisabled(disabled) {
       Object.keys(resourceFields).forEach((key) => setFieldDisabled(key, disabled));
       if (disabled) {
-        clearResourceLists();
         const meta = document.getElementById('partitionMeta');
         if (meta) meta.textContent = '';
       }
@@ -2662,9 +2770,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
         preserved[key] = getValue(key);
       });
       clusterInfo = null;
-      setClusterMode(false);
       setResourceDisabled(false);
-      clearResourceLists();
+      clearResourceOptions();
       setModuleOptions([]);
       Object.keys(preserved).forEach((key) => {
         if (preserved[key] !== undefined && preserved[key] !== null) {
@@ -2674,6 +2781,31 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const meta = document.getElementById('partitionMeta');
       if (meta) meta.textContent = '';
       setStatus('Cluster info cleared. Enter values manually or click \"Get cluster info\".', false);
+    }
+
+    function clearResourceFields() {
+      const resourceKeys = [
+        'defaultPartition',
+        'defaultNodes',
+        'defaultTasksPerNode',
+        'defaultCpusPerTask',
+        'defaultTime',
+        'defaultMemoryMb',
+        'defaultGpuType',
+        'defaultGpuCount'
+      ];
+      resourceKeys.forEach((key) => {
+        setValue(key, '');
+        lastValues[key] = '';
+      });
+      selectedModules = [];
+      customModuleCommand = '';
+      renderModuleList();
+      const moduleInput = document.getElementById('moduleInput');
+      if (moduleInput) moduleInput.value = '';
+      const meta = document.getElementById('partitionMeta');
+      if (meta) meta.textContent = '';
+      updatePartitionDetails();
     }
 
     function buildRangeOptions(maxValue) {
@@ -2717,17 +2849,14 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (!clusterInfo || !clusterInfo.partitions) return;
       const selected = getValue('defaultPartition').trim();
       let chosen = selected ? clusterInfo.partitions.find((p) => p.name === selected) : undefined;
-      if (!chosen && !selected) {
-        chosen = clusterInfo.partitions[0];
-      }
       if (!chosen) {
         const meta = document.getElementById('partitionMeta');
         if (meta) meta.textContent = '';
-        clearDatalist('nodesOptions');
-        clearDatalist('cpusOptions');
-        clearDatalist('memoryOptions');
-        clearDatalist('gpuTypeOptions');
-        clearDatalist('gpuCountOptions');
+        setFieldOptions('defaultNodes', [], '');
+        setFieldOptions('defaultCpusPerTask', [], '');
+        setFieldOptions('defaultMemoryMb', [], '');
+        setFieldOptions('defaultGpuType', [], '');
+        setFieldOptions('defaultGpuCount', [], '');
         return;
       }
 
@@ -2796,18 +2925,16 @@ function getWebviewHtml(webview: vscode.Webview): string {
       setModuleOptions(info && Array.isArray(info.modules) ? info.modules : []);
       if (!info || !info.partitions || info.partitions.length === 0) {
         setStatus('No partitions found.', true);
-        clearResourceLists();
-        setClusterMode(false);
+        clearResourceOptions();
         setResourceDisabled(false);
         return;
       }
       setResourceDisabled(false);
-      setClusterMode(true);
       const options = info.partitions.map((partition) => ({
         value: partition.name,
         label: partition.isDefault ? partition.name + ' (default)' : partition.name
       }));
-      const preferredPartition = manualPartition || lastValues.defaultPartition || info.defaultPartition;
+      const preferredPartition = manualPartition || lastValues.defaultPartition;
       setFieldOptions('defaultPartition', options, preferredPartition);
       updatePartitionDetails();
       setStatus('Loaded ' + info.partitions.length + ' partitions.', false);
@@ -2816,9 +2943,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function setValue(id, value) {
       if (resourceFields[id]) {
         const field = resourceFields[id];
-        const select = document.getElementById(field.select);
         const input = document.getElementById(field.input);
-        if (select) select.value = value ?? '';
         if (input) input.value = value ?? '';
         return;
       }
@@ -2834,12 +2959,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function getValue(id) {
       if (resourceFields[id]) {
         const field = resourceFields[id];
-        const el = document.getElementById(clusterMode ? field.select : field.input);
-        if (el) {
-          return el.value || '';
-        }
-        const fallback = document.getElementById(field.input);
-        return fallback ? fallback.value || '' : '';
+        const el = document.getElementById(field.input);
+        return el ? el.value || '' : '';
       }
       const el = document.getElementById(id);
       if (!el) return '';
@@ -2862,6 +2983,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
         user: getValue('user'),
         identityFile: getValue('identityFile'),
         moduleLoad: getValue('moduleLoad'),
+        moduleSelections: selectedModules.slice(),
+        moduleCustomCommand: customModuleCommand,
         proxyCommand: getValue('proxyCommand'),
         proxyArgs: getValue('proxyArgs'),
         extraSallocArgs: getValue('extraSallocArgs'),
@@ -2903,7 +3026,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         const values = message.values || {};
         lastValues = values;
         Object.keys(values).forEach((key) => setValue(key, values[key]));
-        applyModuleLoad(values.moduleLoad);
+        applyModuleState(values);
         if (message.clusterInfo) {
           applyClusterInfo(message.clusterInfo);
           if (message.clusterInfoCachedAt) {
@@ -2912,11 +3035,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
           }
         } else {
           clusterInfo = null;
-          clearResourceLists();
+          clearResourceOptions();
           const meta = document.getElementById('partitionMeta');
           if (meta) meta.textContent = '';
           setModuleOptions([]);
-          setClusterMode(false);
           setResourceDisabled(false);
           setStatus('Enter values manually or click "Get cluster info" to populate suggestions.', false);
         }
@@ -2947,10 +3069,36 @@ function getWebviewHtml(webview: vscode.Webview): string {
       clearClusterInfoUi();
     });
 
+    document.getElementById('clearResources').addEventListener('click', () => {
+      clearResourceFields();
+    });
+
     const moduleAddButton = document.getElementById('moduleAdd');
     const moduleInput = document.getElementById('moduleInput');
-    const moduleToggle = document.getElementById('moduleToggle');
     const moduleMenu = document.getElementById('moduleMenu');
+    const modulePicker = document.getElementById('modulePicker');
+    const ignoreNextInputClicks = new Set();
+
+    function shouldIgnoreInputClick(inputId) {
+      if (ignoreNextInputClicks.has(inputId)) {
+        ignoreNextInputClicks.delete(inputId);
+        return true;
+      }
+      return false;
+    }
+
+    function isInsideAnyPicker(target) {
+      if (!(target instanceof Node)) {
+        return false;
+      }
+      if (modulePicker && modulePicker.contains(target)) {
+        return true;
+      }
+      return Object.values(resourceFields).some((field) => {
+        const picker = document.getElementById(field.picker);
+        return picker ? picker.contains(target) : false;
+      });
+    }
     if (moduleAddButton) {
       moduleAddButton.addEventListener('click', () => {
         addModulesFromInput();
@@ -2958,25 +3106,23 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
     if (moduleInput) {
       moduleInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          hideModuleMenu();
+          return;
+        }
+        if (event.key === 'ArrowDown') {
+          showModuleMenu(true);
+          return;
+        }
         if (event.key === 'Enter') {
           event.preventDefault();
           addModulesFromInput();
         }
       });
-      moduleInput.addEventListener('input', () => {
-        showModuleMenu(false);
-      });
-      moduleInput.addEventListener('focus', () => {
-        showModuleMenu(true);
-      });
-      moduleInput.addEventListener('blur', () => {
-        setTimeout(() => {
-          hideModuleMenu();
-        }, 150);
-      });
-    }
-    if (moduleToggle) {
-      moduleToggle.addEventListener('click', () => {
+      moduleInput.addEventListener('click', () => {
+        if (shouldIgnoreInputClick('moduleInput')) {
+          return;
+        }
         const isOpen = moduleMenu && moduleMenu.classList.contains('visible');
         if (isOpen) {
           hideModuleMenu();
@@ -2984,41 +3130,99 @@ function getWebviewHtml(webview: vscode.Webview): string {
           showModuleMenu(true);
         }
       });
+      moduleInput.addEventListener('input', () => {
+        showModuleMenu(false);
+      });
+      moduleInput.addEventListener('blur', () => {
+        setTimeout(() => {
+          hideModuleMenu();
+        }, 150);
+      });
     }
     if (moduleMenu) {
       moduleMenu.addEventListener('mousedown', (event) => {
         event.preventDefault();
       });
     }
+    Object.keys(resourceFields).forEach((fieldKey) => {
+      const field = resourceFields[fieldKey];
+      const input = document.getElementById(field.input);
+      const menu = document.getElementById(field.menu);
+      if (!input) return;
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          hideFieldMenu(fieldKey);
+          return;
+        }
+        if (event.key === 'ArrowDown') {
+          showFieldMenu(fieldKey, true);
+          return;
+        }
+        if (event.key === 'Enter') {
+          hideFieldMenu(fieldKey);
+        }
+      });
+      input.addEventListener('click', () => {
+        if (shouldIgnoreInputClick(field.input)) {
+          return;
+        }
+        const isOpen = menu && menu.classList.contains('visible');
+        if (isOpen) {
+          hideFieldMenu(fieldKey);
+        } else {
+          showFieldMenu(fieldKey, true);
+        }
+      });
+      input.addEventListener('input', () => {
+        showFieldMenu(fieldKey, false);
+      });
+      input.addEventListener('blur', () => {
+        setTimeout(() => {
+          hideFieldMenu(fieldKey);
+        }, 150);
+      });
+      if (menu) {
+        menu.addEventListener('mousedown', (event) => {
+          event.preventDefault();
+        });
+      }
+    });
+    document.addEventListener('mousedown', (event) => {
+      const target = event.target;
+      if (target instanceof Element) {
+        const label = target.closest('label');
+        if (label && label.htmlFor) {
+          ignoreNextInputClicks.add(label.htmlFor);
+        }
+      }
+      if (isInsideAnyPicker(target)) {
+        return;
+      }
+      closeAllMenus();
+    });
 
     function addFieldListener(fieldKey, handler) {
       const field = resourceFields[fieldKey];
       if (!field) return;
-      [field.select, field.input].forEach((id) => {
-        const el = document.getElementById(id);
-        if (el) el.addEventListener('change', handler);
-      });
+      const input = document.getElementById(field.input);
+      if (input) {
+        input.addEventListener('change', handler);
+        input.addEventListener('input', handler);
+      }
     }
 
     addFieldListener('defaultPartition', updatePartitionDetails);
     addFieldListener('defaultGpuType', updatePartitionDetails);
 
     document.getElementById('profileSelect').addEventListener('change', () => {
-      const name = getSelectedProfileName();
-      const input = document.getElementById('profileName');
-      if (input) input.value = name;
+      // no-op, selection already reflects current profile
     });
 
     document.getElementById('profileSave').addEventListener('click', () => {
-      const name = getProfileNameInput() || getSelectedProfileName();
-      if (!name) {
-        setProfileStatus('Enter a profile name to save.', true);
-        return;
-      }
       setProfileStatus('Saving profile...', false);
       vscode.postMessage({
         command: 'saveProfile',
-        name,
+        suggestedName: getSelectedProfileName(),
         values: gather()
       });
     });
@@ -3040,9 +3244,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const name = getSelectedProfileName();
       if (!name) {
         setProfileStatus('Select a profile to delete.', true);
-        return;
-      }
-      if (!confirm('Delete profile "' + name + '"?')) {
         return;
       }
       setProfileStatus('Deleting profile...', false);
