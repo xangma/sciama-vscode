@@ -2,7 +2,7 @@
   "name": "sciama-vscode",
   "displayName": "Sciama Slurm Connect",
   "description": "Select Slurm resources and connect VS Code Remote-SSH through a compute allocation.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "xangma",
   "repository": "https://github.com/xangma/sciama-vscode",
   "engines": {
