@@ -19,6 +19,18 @@ The extension will query the login host, create a temporary SSH config entry, co
 
 ## Usage details
 
+### Get cluster info
+The **Get cluster info** button queries your login host to discover available Slurm partitions and their limits
+(nodes, CPUs, memory, GPUs). It also tries to read the available modules list. The results are used to populate
+the dropdowns and suggestions in the UI so you can pick valid values quickly. You can still type values manually,
+and the fetched data is cached per login host to speed up the next load.
+
+### Profiles
+Profiles let you save and switch between sets of Slurm Connect inputs (login host, identity file, partitions,
+resource defaults, module selections, etc.). Use **Save profile** to store the current form values, **Load** to
+apply a saved profile, and **Delete** to remove one you no longer need. Profiles are stored in the extension
+state and do not change your VS Code settings.
+
 ### SSH authentication for cluster info
 Cluster info queries use non-interactive SSH (`BatchMode=yes`). If your key is encrypted, you can either use ssh-agent or enter the passphrase in a terminal when prompted.
 
@@ -45,16 +57,6 @@ https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_
 ```
 - Otherwise you will be prompted for your passphrase when getting cluster info or connecting.
 
-### Modules
-The extension runs your **module load** command before starting the proxy on the login node. This is where you should add any required cluster modules (e.g. anaconda, cuda, or custom environment setup).
-
-Example:
-```json
-{
-  "slurmConnect.moduleLoad": "module load anaconda3/2024.02"
-}
-```
-
 ### Proxy command (cluster-specific)
 This extension expects a proxy script on your cluster's login nodes. The default is:
 
@@ -75,46 +77,13 @@ The "slurmConnect.proxyCommand" setting must execute it, e.g.:
 ```
 
 ### Remote folder (recommended)
-If you forget to set a remote folder, VS Code may reconnect and create a new Slurm job when you later open a folder. To avoid that, you should set a remote folder up front:
+If you forget to set a remote folder, VS Code may reconnect and create a new Slurm job when you later open a folder. To avoid that, you should set a remote folder up front in the side panel, set **Remote folder** (recommended).
 
-- In the side panel, set **Remote folder** (recommended)
-- Or set it in settings:
-```json
-{
-  "slurmConnect.remoteWorkspacePath": "/home/youruser/project"
-}
-```
-
-## Example settings
-```json
-{
-  "slurmConnect.loginHosts": [
-    "hostname1.com",
-  ],
-  "slurmConnect.loginHostsCommand": "",
-  "slurmConnect.proxyCommand": "python /usr/bin/vscode-shell-proxy.py",
-  "slurmConnect.identityFile": "~/.ssh/id_rsa",
-  "slurmConnect.defaultNodes": 1,
-  "slurmConnect.defaultTasksPerNode": 1,
-  "slurmConnect.defaultCpusPerTask": 8,
-  "slurmConnect.defaultTime": "24:00:00",
-  "slurmConnect.remoteWorkspacePath": "/home/youruser/project"
-}
-```
-
-## Discover login hosts
-If your cluster can return login hosts via a command, set:
-```json
-{
-  "slurmConnect.loginHostsCommand": "your-command-here",
-  "slurmConnect.loginHostsQueryHost": "hostname1.com"
-}
-```
-The command should output hostnames separated by whitespace or newlines.
 
 ## Notes
 - Ensure **Remote.SSH: Enable Remote Command** is enabled (the extension will prompt to enable it).
 - **Remote.SSH: Lockfiles In Tmp** is recommended on shared filesystems (the extension will prompt to enable it).
+- The extension will also prompt to put `"remote.SSH.useLocalServer": true` in your vscode settings file if you're on Windows due to a bug with the Remote-SSH extension not respecting the default value from the GUI.
 - This extension uses a temporary SSH config for each connection and does not modify your main SSH config.
 - Use `slurmConnect.openInNewWindow` to control whether the connection opens in a new window (default: false).
 - `slurmConnect.partitionInfoCommand` controls how cluster info is fetched (default: `sinfo -h -N -o "%P|%n|%c|%m|%G"`).
