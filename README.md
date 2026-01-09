@@ -7,7 +7,7 @@ This extension helps users allocate Slurm resources on a cluster and connect VS 
 - SSH keys configured for the cluster (agent forwarding recommended).
 - Python 3.9+ available on the login nodes.
 - `vscode-shell-proxy.py` available on the login nodes (via module load or PATH).
-- ssh-agent running with your key added.
+- ssh-agent running with your key added (recommended for encrypted keys).
 
 ## Quick start (users)
 1. Install the extension.
@@ -19,11 +19,12 @@ The extension will query the login host, create a temporary SSH config entry, co
 
 ## Usage details
 
-### SSH agent requirement
-Cluster info queries use non-interactive SSH (`BatchMode=yes`), so your SSH key must be available to the agent.
+### SSH authentication for cluster info
+Cluster info queries use non-interactive SSH (`BatchMode=yes`). If your key is encrypted, you can either use ssh-agent or enter the passphrase in a terminal when prompted.
 
-- If the key is **not** in your agent, the extension will prompt you to add it.
-- When prompted, it will open a terminal, run `ssh-add`, and wait for the key to appear in your agent.
+- If the key is **not** in your agent, the extension will prompt you to either enter a passphrase in the terminal or add it.
+- When you choose to add it, the extension opens a terminal, runs `ssh-add`, and waits for the key to appear in your agent.
+- If the SSH agent is unavailable, the extension will only offer the terminal passphrase prompt.
 
 If you prefer to do this manually:
 ```bash

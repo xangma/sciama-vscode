@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import * as jsonc from 'jsonc-parser';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { buildHostEntry, buildTemporarySshConfigContent, expandHome } from './utils/sshConfig';
@@ -55,17 +56,19 @@ interface PartitionResult {
 }
 
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
+type SshAuthMode = 'agent' | 'terminal';
 
 let outputChannel: vscode.OutputChannel | undefined;
 let logFilePath: string | undefined;
 let extensionStoragePath: string | undefined;
 let extensionGlobalState: vscode.Memento | undefined;
+let extensionWorkspaceState: vscode.Memento | undefined;
 let activeWebview: vscode.Webview | undefined;
 let connectionState: ConnectionState = 'idle';
 let lastConnectionAlias: string | undefined;
 let previousRemoteSshConfigPath: string | undefined;
 let activeTempSshConfigPath: string | undefined;
-let lastSshAuthPrompt: { identityPath: string; timestamp: number } | undefined;
+let lastSshAuthPrompt: { identityPath: string; timestamp: number; mode: SshAuthMode } | undefined;
 let clusterInfoRequestInFlight = false;
 const SETTINGS_SECTION = 'slurmConnect';
 const LEGACY_SETTINGS_SECTION = 'sciamaSlurm';
@@ -73,6 +76,7 @@ const PROFILE_STORE_KEY = 'slurmConnect.profiles';
 const ACTIVE_PROFILE_KEY = 'slurmConnect.activeProfile';
 const PENDING_RESTORE_KEY = 'slurmConnect.pendingRestore';
 const CLUSTER_INFO_CACHE_KEY = 'slurmConnect.clusterInfoCache';
+const CLUSTER_UI_CACHE_KEY = 'slurmConnect.clusterUiCache';
 const LEGACY_PROFILE_STORE_KEY = 'sciamaSlurm.profiles';
 const LEGACY_ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
 const LEGACY_PENDING_RESTORE_KEY = 'sciamaSlurm.pendingRestore';
@@ -111,12 +115,39 @@ const CONFIG_KEYS = [
   'sshQueryConfigPath',
   'sshConnectTimeoutSeconds'
 ];
+const CLUSTER_SETTING_KEYS = [
+  'loginHosts',
+  'loginHostsCommand',
+  'loginHostsQueryHost',
+  'partitionCommand',
+  'partitionInfoCommand',
+  'qosCommand',
+  'accountCommand',
+  'user',
+  'identityFile',
+  'moduleLoad',
+  'proxyCommand',
+  'proxyArgs',
+  'extraSallocArgs',
+  'defaultPartition',
+  'defaultNodes',
+  'defaultTasksPerNode',
+  'defaultCpusPerTask',
+  'defaultTime',
+  'defaultMemoryMb',
+  'defaultGpuType',
+  'defaultGpuCount'
+] as const;
+
+type ClusterSettingKey = typeof CLUSTER_SETTING_KEYS[number];
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   extensionStoragePath = context.globalStorageUri.fsPath;
   extensionGlobalState = context.globalState;
+  extensionWorkspaceState = context.workspaceState;
   await migrateLegacyState();
   await migrateLegacySettings();
+  await migrateClusterSettingsToCache();
   syncConnectionStateFromEnvironment();
   const disposable = vscode.commands.registerCommand('slurmConnect.connect', () => {
     void connectCommand();
@@ -233,6 +264,133 @@ async function migrateLegacySettings(): Promise<void> {
           // Ignore cleanup failures.
         }
       }
+    }
+  }
+}
+
+function mapConfigValueToUi(key: ClusterSettingKey, value: unknown): string {
+  switch (key) {
+    case 'loginHosts':
+    case 'proxyArgs':
+    case 'extraSallocArgs': {
+      if (Array.isArray(value)) {
+        return value.map((entry) => String(entry)).join('\n');
+      }
+      if (typeof value === 'string') {
+        return value;
+      }
+      return value === undefined || value === null ? '' : String(value);
+    }
+    case 'defaultNodes':
+    case 'defaultTasksPerNode':
+    case 'defaultCpusPerTask':
+    case 'defaultMemoryMb':
+    case 'defaultGpuCount': {
+      const numeric = typeof value === 'number' ? value : Number(value);
+      if (!Number.isFinite(numeric) || numeric <= 0) {
+        return '';
+      }
+      return String(Math.floor(numeric));
+    }
+    default:
+      return value === undefined || value === null ? '' : String(value);
+  }
+}
+
+async function migrateClusterSettingsToCache(): Promise<void> {
+  if (!extensionGlobalState) {
+    return;
+  }
+
+  const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
+  const folders = vscode.workspace.workspaceFolders || [];
+
+  const nextGlobalCache: ClusterUiCache = { ...(getClusterUiCache(extensionGlobalState) || {}) };
+  const nextWorkspaceCache: ClusterUiCache = { ...(getClusterUiCache(extensionWorkspaceState) || {}) };
+  let updatedGlobal = false;
+  let updatedWorkspace = false;
+
+  const globalKeysToClear = new Set<ClusterSettingKey>();
+  const workspaceKeysToClear = new Set<ClusterSettingKey>();
+  const folderKeysToClear: Array<{ key: ClusterSettingKey; folder: vscode.WorkspaceFolder }> = [];
+
+  for (const key of CLUSTER_SETTING_KEYS) {
+    const inspect = cfg.inspect(key);
+    if (inspect?.globalValue !== undefined) {
+      if (!Object.prototype.hasOwnProperty.call(nextGlobalCache, key)) {
+        nextGlobalCache[key] = mapConfigValueToUi(key, inspect.globalValue);
+        updatedGlobal = true;
+      }
+      globalKeysToClear.add(key);
+    }
+    if (inspect?.workspaceValue !== undefined) {
+      if (!Object.prototype.hasOwnProperty.call(nextWorkspaceCache, key)) {
+        nextWorkspaceCache[key] = mapConfigValueToUi(key, inspect.workspaceValue);
+        updatedWorkspace = true;
+      }
+      workspaceKeysToClear.add(key);
+    }
+
+    if (folders.length > 0) {
+      const folderValues: Array<{ folder: vscode.WorkspaceFolder; value: unknown }> = [];
+      for (const folder of folders) {
+        const folderCfg = vscode.workspace.getConfiguration(SETTINGS_SECTION, folder.uri);
+        const folderInspect = folderCfg.inspect(key);
+        if (folderInspect?.workspaceFolderValue !== undefined) {
+          folderValues.push({ folder, value: folderInspect.workspaceFolderValue });
+        }
+      }
+
+      if (folderValues.length > 0) {
+        const serialized = folderValues.map((entry) => JSON.stringify(entry.value));
+        const unique = new Set(serialized);
+        if (unique.size === 1) {
+          if (inspect?.workspaceValue === undefined) {
+            if (!Object.prototype.hasOwnProperty.call(nextWorkspaceCache, key)) {
+              nextWorkspaceCache[key] = mapConfigValueToUi(key, folderValues[0].value);
+              updatedWorkspace = true;
+            }
+          }
+          folderValues.forEach((entry) => {
+            folderKeysToClear.push({ key, folder: entry.folder });
+          });
+        } else {
+          const log = getOutputChannel();
+          log.appendLine(
+            `Skipping migration for ${SETTINGS_SECTION}.${key} workspace-folder values because they differ across folders.`
+          );
+        }
+      }
+    }
+  }
+
+  if (updatedGlobal) {
+    await extensionGlobalState.update(CLUSTER_UI_CACHE_KEY, nextGlobalCache);
+  }
+  if (updatedWorkspace && extensionWorkspaceState) {
+    await extensionWorkspaceState.update(CLUSTER_UI_CACHE_KEY, nextWorkspaceCache);
+  }
+
+  for (const key of globalKeysToClear) {
+    try {
+      await cfg.update(key, undefined, vscode.ConfigurationTarget.Global);
+    } catch {
+      // Ignore cleanup failures.
+    }
+  }
+  for (const key of workspaceKeysToClear) {
+    try {
+      await cfg.update(key, undefined, vscode.ConfigurationTarget.Workspace);
+    } catch {
+      // Ignore cleanup failures.
+    }
+  }
+  for (const entry of folderKeysToClear) {
+    try {
+      const folderCfg = vscode.workspace.getConfiguration(SETTINGS_SECTION, entry.folder.uri);
+      await folderCfg.update(entry.key, undefined, vscode.ConfigurationTarget.WorkspaceFolder);
+    } catch {
+      // Ignore cleanup failures.
     }
   }
 }
@@ -368,6 +526,34 @@ interface UiValues {
   remoteWorkspacePath: string;
 }
 
+type ClusterUiCache = Partial<UiValues>;
+
+const CLUSTER_UI_KEYS = new Set<keyof UiValues>([
+  'loginHosts',
+  'loginHostsCommand',
+  'loginHostsQueryHost',
+  'partitionCommand',
+  'partitionInfoCommand',
+  'qosCommand',
+  'accountCommand',
+  'user',
+  'identityFile',
+  'moduleLoad',
+  'moduleSelections',
+  'moduleCustomCommand',
+  'proxyCommand',
+  'proxyArgs',
+  'extraSallocArgs',
+  'defaultPartition',
+  'defaultNodes',
+  'defaultTasksPerNode',
+  'defaultCpusPerTask',
+  'defaultTime',
+  'defaultMemoryMb',
+  'defaultGpuType',
+  'defaultGpuCount'
+]);
+
 interface ProfileEntry {
   name: string;
   values: UiValues;
@@ -438,7 +624,7 @@ function syncConnectionStateFromEnvironment(): void {
 }
 
 function mergeUiValuesWithDefaults(values?: Partial<UiValues>): UiValues {
-  const defaults = getUiValuesFromConfig(getConfig());
+  const defaults = getUiValuesFromStorage();
   if (!values) {
     return defaults;
   }
@@ -446,6 +632,55 @@ function mergeUiValuesWithDefaults(values?: Partial<UiValues>): UiValues {
     ...defaults,
     ...values
   } as UiValues;
+}
+
+function pickClusterUiValues(values: UiValues): ClusterUiCache {
+  const picked: ClusterUiCache = {};
+  for (const key of CLUSTER_UI_KEYS) {
+    const value = values[key];
+    if (value !== undefined) {
+      (picked as Record<keyof UiValues, UiValues[keyof UiValues]>)[key] = value;
+    }
+  }
+  return picked;
+}
+
+function getClusterUiCache(state?: vscode.Memento): ClusterUiCache | undefined {
+  if (!state) {
+    return undefined;
+  }
+  return state.get<ClusterUiCache>(CLUSTER_UI_CACHE_KEY);
+}
+
+function getMergedClusterUiCache(): ClusterUiCache | undefined {
+  const globalCache = getClusterUiCache(extensionGlobalState) || {};
+  const hasWorkspace = Boolean(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0);
+  const workspaceCache = hasWorkspace ? getClusterUiCache(extensionWorkspaceState) || {} : {};
+  const merged = { ...globalCache, ...workspaceCache };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function resolvePreferredSaveTarget(): 'global' | 'workspace' {
+  if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+    return 'global';
+  }
+  const workspaceCache = getClusterUiCache(extensionWorkspaceState);
+  if (workspaceCache && Object.keys(workspaceCache).length > 0) {
+    return 'workspace';
+  }
+  return 'global';
+}
+
+async function updateClusterUiCache(values: UiValues, target: vscode.ConfigurationTarget): Promise<void> {
+  const hasWorkspace = Boolean(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0);
+  const useWorkspace =
+    hasWorkspace &&
+    (target === vscode.ConfigurationTarget.Workspace || target === vscode.ConfigurationTarget.WorkspaceFolder);
+  const state = useWorkspace ? extensionWorkspaceState : extensionGlobalState;
+  if (!state) {
+    return;
+  }
+  await state.update(CLUSTER_UI_CACHE_KEY, pickClusterUiValues(values));
 }
 
 function getProfileStore(): ProfileStore {
@@ -519,7 +754,7 @@ async function maybeRestorePendingOnStartup(): Promise<void> {
   await restoreRemoteSshConfigIfNeeded();
 }
 
-function getConfig(): SlurmConnectConfig {
+function getConfigFromSettings(): SlurmConnectConfig {
   const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
   const user = (cfg.get<string>('user') || '').trim();
   return {
@@ -555,6 +790,19 @@ function getConfig(): SlurmConnectConfig {
     additionalSshOptions: cfg.get<Record<string, string>>('additionalSshOptions', {}),
     sshQueryConfigPath: (cfg.get<string>('sshQueryConfigPath') || '').trim(),
     sshConnectTimeoutSeconds: cfg.get<number>('sshConnectTimeoutSeconds', 15)
+  };
+}
+
+function getConfig(): SlurmConnectConfig {
+  const base = getConfigFromSettings();
+  const cachedUi = getMergedClusterUiCache();
+  if (!cachedUi) {
+    return base;
+  }
+  const overrides = buildClusterOverridesFromUi(cachedUi);
+  return {
+    ...base,
+    ...overrides
   };
 }
 
@@ -594,7 +842,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
         case 'ready': {
           syncConnectionStateFromEnvironment();
           let activeProfile = getActiveProfileName();
-          const defaults = getUiValuesFromConfig(getConfig());
+          const defaults = getUiValuesFromStorage();
           let values = defaults;
           if (activeProfile) {
             const stored = getProfileValues(activeProfile);
@@ -604,6 +852,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
               activeProfile = undefined;
             }
           }
+          const agentStatus = await buildAgentStatusMessage(values.identityFile);
           const host = firstLoginHostFromInput(values.loginHosts);
           const cached = host ? getCachedClusterInfo(host) : undefined;
           webview.postMessage({
@@ -614,7 +863,10 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             profiles: getProfileSummaries(getProfileStore()),
             activeProfile,
             connectionState,
-            remoteActive: vscode.env.remoteName === 'ssh-remote'
+            agentStatus: agentStatus.text,
+            agentStatusError: agentStatus.isError,
+            remoteActive: vscode.env.remoteName === 'ssh-remote',
+            saveTarget: resolvePreferredSaveTarget()
           });
           break;
         }
@@ -735,7 +987,8 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             activeProfile: name,
             connectionState,
             remoteActive: vscode.env.remoteName === 'ssh-remote',
-            profileStatus: `Loaded profile "${name}".`
+            profileStatus: `Loaded profile "${name}".`,
+            saveTarget: resolvePreferredSaveTarget()
           });
           break;
         }
@@ -1012,12 +1265,6 @@ async function connectCommand(
     cfg.remoteWorkspacePath
   );
   didConnect = connected;
-  if (connected && !cfg.openInNewWindow) {
-    await delay(500);
-    await restoreRemoteSshConfigIfNeeded();
-  } else if (connected && cfg.openInNewWindow) {
-    log.appendLine('Deferring SSH config restore until the remote window is ready.');
-  }
   if (!connected) {
     void vscode.window.showWarningMessage(
       `SSH host "${alias.trim()}" created, but auto-connect failed. Use Remote-SSH to connect.`,
@@ -1028,7 +1275,14 @@ async function connectCommand(
       }
     });
     await restoreRemoteSshConfigIfNeeded();
+    return didConnect;
   }
+  if (cfg.openInNewWindow) {
+    log.appendLine('Deferring SSH config restore until the remote window is ready.');
+    return didConnect;
+  }
+  await waitForRemoteConnectionOrTimeout(30_000, 500);
+  await restoreRemoteSshConfigIfNeeded();
 
   return didConnect;
 }
@@ -1146,7 +1400,13 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
     if (loginHosts.length === 0) {
       const message = 'Enter a login host before fetching cluster info.';
       void vscode.window.showErrorMessage(message);
-      webview.postMessage({ command: 'clusterInfoError', message });
+      const agentStatus = await buildAgentStatusMessage(values.identityFile);
+      webview.postMessage({
+        command: 'clusterInfoError',
+        message,
+        agentStatus: agentStatus.text,
+        agentStatusError: agentStatus.isError
+      });
       return;
     }
 
@@ -1155,11 +1415,23 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
 
     const info = await fetchClusterInfo(loginHost, cfg);
     cacheClusterInfo(loginHost, info);
-    webview.postMessage({ command: 'clusterInfo', info });
+    const agentStatus = await buildAgentStatusMessage(values.identityFile);
+    webview.postMessage({
+      command: 'clusterInfo',
+      info,
+      agentStatus: agentStatus.text,
+      agentStatusError: agentStatus.isError
+    });
   } catch (error) {
     const message = formatError(error);
     void vscode.window.showErrorMessage(`Failed to fetch cluster info: ${message}`);
-    webview.postMessage({ command: 'clusterInfoError', message });
+    const agentStatus = await buildAgentStatusMessage(values.identityFile);
+    webview.postMessage({
+      command: 'clusterInfoError',
+      message,
+      agentStatus: agentStatus.text,
+      agentStatusError: agentStatus.isError
+    });
   } finally {
     clusterInfoRequestInFlight = false;
   }
@@ -1237,9 +1509,118 @@ function looksLikeAuthFailure(text: string): boolean {
     /permission denied/i,
     /no identities/i,
     /authentication agent/i,
+    /read_passphrase/i,
+    /enter passphrase/i,
     /sign_and_send_pubkey/i,
     /identity file .* not accessible/i
   ].some((pattern) => pattern.test(text));
+}
+
+function buildSshArgs(
+  host: string,
+  cfg: SlurmConnectConfig,
+  command: string,
+  options: { batchMode: boolean }
+): string[] {
+  const args: string[] = [];
+  if (cfg.sshQueryConfigPath) {
+    args.push('-F', expandHome(cfg.sshQueryConfigPath));
+  }
+  args.push('-T', '-o', `BatchMode=${options.batchMode ? 'yes' : 'no'}`, '-o', `ConnectTimeout=${cfg.sshConnectTimeoutSeconds}`);
+  if (cfg.identityFile) {
+    args.push('-i', expandHome(cfg.identityFile));
+  }
+  const target = cfg.user ? `${cfg.user}@${host}` : host;
+  args.push(target, command);
+  return args;
+}
+
+function quoteShellArg(value: string): string {
+  if (value === '') {
+    return "''";
+  }
+  if (/^[A-Za-z0-9_./:@%+=-]+$/.test(value)) {
+    return value;
+  }
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+async function createTerminalSshRunFiles(): Promise<{
+  dirPath: string;
+  stdoutPath: string;
+  statusPath: string;
+}> {
+  const dirPath = await fs.mkdtemp(path.join(os.tmpdir(), 'slurm-connect-ssh-'));
+  return {
+    dirPath,
+    stdoutPath: path.join(dirPath, 'stdout.txt'),
+    statusPath: path.join(dirPath, 'status.txt')
+  };
+}
+
+async function waitForFile(filePath: string, timeoutMs: number, pollMs: number): Promise<boolean> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      await fs.access(filePath);
+      return true;
+    } catch {
+      // Keep waiting.
+    }
+    await delay(pollMs);
+  }
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runSshCommandInTerminal(
+  host: string,
+  cfg: SlurmConnectConfig,
+  command: string
+): Promise<string> {
+  if (process.platform === 'win32') {
+    throw new Error('Terminal passphrase prompt is not supported on Windows.');
+  }
+  const args = buildSshArgs(host, cfg, command, { batchMode: false });
+  const { dirPath, stdoutPath, statusPath } = await createTerminalSshRunFiles();
+  const sshCommand = ['ssh', ...args].map(quoteShellArg).join(' ');
+  const shellCommand = `${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
+  const terminal = vscode.window.createTerminal({ name: 'Slurm Connect SSH' });
+  terminal.show(true);
+  terminal.sendText(shellCommand, true);
+  void vscode.window.showInformationMessage('Enter your SSH key passphrase in the terminal.');
+
+  let stdout = '';
+  let exitCode = NaN;
+  try {
+    const completed = await waitForFile(statusPath, cfg.sshConnectTimeoutSeconds * 1000, 500);
+    if (!completed) {
+      throw new Error('Timed out waiting for SSH to finish in the terminal.');
+    }
+    const statusText = await fs.readFile(statusPath, 'utf8');
+    exitCode = Number(statusText.trim());
+    try {
+      stdout = await fs.readFile(stdoutPath, 'utf8');
+    } catch {
+      stdout = '';
+    }
+  } finally {
+    try {
+      await fs.rm(dirPath, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup failures.
+    }
+  }
+
+  if (!Number.isFinite(exitCode) || exitCode !== 0) {
+    throw new Error('SSH command failed in the terminal. Check the terminal output for details.');
+  }
+  terminal.dispose();
+  return stdout.trim();
 }
 
 async function getPublicKeyFingerprint(identityPath: string): Promise<string | undefined> {
@@ -1265,19 +1646,45 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-async function isSshKeyLoaded(identityPath: string): Promise<boolean> {
-  if (!identityPath) {
-    return false;
-  }
-  let output = '';
+type SshAgentStatus = 'available' | 'empty' | 'unavailable';
+
+interface SshAgentInfo {
+  status: SshAgentStatus;
+  output: string;
+}
+
+function looksLikeAgentUnavailable(text: string): boolean {
+  return [
+    /could not open a connection to your authentication agent/i,
+    /error connecting to agent/i,
+    /communication with agent failed/i,
+    /agent refused operation/i,
+    /no such file or directory/i
+  ].some((pattern) => pattern.test(text));
+}
+
+async function getSshAgentInfo(): Promise<SshAgentInfo> {
   try {
     const result = await execFileAsync('ssh-add', ['-l']);
-    output = [result.stdout, result.stderr].filter(Boolean).join('\n');
+    const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
+    if (!output.trim() || /no identities/i.test(output)) {
+      return { status: 'empty', output };
+    }
+    return { status: 'available', output };
   } catch (error) {
     const errorText = normalizeSshErrorText(error);
     if (/no identities/i.test(errorText)) {
-      return false;
+      return { status: 'empty', output: errorText };
     }
+    if (looksLikeAgentUnavailable(errorText)) {
+      return { status: 'unavailable', output: errorText };
+    }
+    return { status: 'unavailable', output: errorText };
+  }
+}
+
+async function isSshKeyListedInAgentOutput(identityPath: string, output: string): Promise<boolean> {
+  if (!identityPath) {
     return false;
   }
   if (!output.trim()) {
@@ -1304,6 +1711,49 @@ async function isSshKeyLoaded(identityPath: string): Promise<boolean> {
   return false;
 }
 
+async function buildAgentStatusMessage(identityPathRaw: string): Promise<{ text: string; isError: boolean }> {
+  const agentInfo = await getSshAgentInfo();
+  const agentBase = agentInfo.status === 'available'
+    ? 'SSH agent running'
+    : agentInfo.status === 'empty'
+      ? 'SSH agent running (no keys loaded)'
+      : 'SSH agent unavailable';
+  if (!identityPathRaw) {
+    const isError = agentInfo.status !== 'available';
+    return { text: `${agentBase}.`, isError };
+  }
+  const identityPath = expandHome(identityPathRaw);
+  const identityExists = await fileExists(identityPath);
+  if (!identityExists) {
+    return { text: `${agentBase}. Identity file not found.`, isError: true };
+  }
+  if (agentInfo.status === 'unavailable') {
+    return {
+      text: `SSH agent unavailable. Passphrase required for ${identityPath}.`,
+      isError: true
+    };
+  }
+  if (agentInfo.status === 'empty') {
+    return { text: 'SSH agent running, no keys loaded.', isError: true };
+  }
+  const keyLoaded = await isSshKeyListedInAgentOutput(identityPath, agentInfo.output);
+  if (keyLoaded) {
+    return { text: 'SSH agent running, key loaded.', isError: false };
+  }
+  return { text: 'SSH agent running, key not loaded.', isError: true };
+}
+
+async function isSshKeyLoaded(identityPath: string): Promise<boolean> {
+  if (!identityPath) {
+    return false;
+  }
+  const agentInfo = await getSshAgentInfo();
+  if (agentInfo.status !== 'available') {
+    return false;
+  }
+  return await isSshKeyListedInAgentOutput(identityPath, agentInfo.output);
+}
+
 
 function buildTerminalSshAddCommand(identityPath: string): string {
   const trimmed = identityPath.trim();
@@ -1322,7 +1772,7 @@ function openSshAddTerminal(identityPath: string): vscode.Terminal {
   terminal.show(true);
   const command = buildTerminalSshAddCommand(identityPath);
   terminal.sendText(command, true);
-  void vscode.window.showInformationMessage('Follow the terminal prompt to add your SSH key.');
+  void vscode.window.showInformationMessage('Follow the terminal prompt to add your SSH key with ssh-add.');
   return terminal;
 }
 
@@ -1353,28 +1803,47 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function maybePromptForSshAuth(cfg: SlurmConnectConfig, errorText: string): Promise<boolean> {
+type SshAuthRetry =
+  | { kind: 'agent' }
+  | { kind: 'terminal' };
+
+async function maybePromptForSshAuth(
+  cfg: SlurmConnectConfig,
+  errorText: string
+): Promise<SshAuthRetry | undefined> {
   if (!looksLikeAuthFailure(errorText)) {
-    return false;
+    return undefined;
   }
   const identityPath = cfg.identityFile ? expandHome(cfg.identityFile) : '';
   const identityExists = identityPath ? await fileExists(identityPath) : false;
-  if (identityPath && identityExists && await isSshKeyLoaded(identityPath)) {
-    return false;
+  const canTerminalPassphrase = process.platform !== 'win32' && Boolean(identityPath && identityExists);
+  const agentInfo = identityPath && identityExists ? await getSshAgentInfo() : undefined;
+  if (identityPath && identityExists && agentInfo?.status === 'available') {
+    if (await isSshKeyListedInAgentOutput(identityPath, agentInfo.output)) {
+      return undefined;
+    }
   }
+  const agentStatus = agentInfo?.status ?? 'unavailable';
+  const canAddToAgent = Boolean(identityPath && identityExists && agentStatus !== 'unavailable');
   const now = Date.now();
   if (lastSshAuthPrompt) {
     const sameIdentity = lastSshAuthPrompt.identityPath === identityPath;
     const recentlyPrompted = now - lastSshAuthPrompt.timestamp < 60_000;
     if (sameIdentity && recentlyPrompted) {
-      return false;
+      if (lastSshAuthPrompt.mode === 'terminal' && canTerminalPassphrase) {
+        lastSshAuthPrompt = { identityPath, timestamp: now, mode: 'terminal' };
+        return { kind: 'terminal' };
+      }
+      return undefined;
     }
   }
-  lastSshAuthPrompt = { identityPath, timestamp: now };
 
   const actions: string[] = [];
-  if (identityPath && identityExists) {
-    actions.push('Open Terminal');
+  if (canTerminalPassphrase) {
+    actions.push('Enter Passphrase in Terminal');
+  }
+  if (canAddToAgent) {
+    actions.push('Add to Agent');
   }
   if (!identityPath || !identityExists) {
     actions.push('Open Settings');
@@ -1383,10 +1852,22 @@ async function maybePromptForSshAuth(cfg: SlurmConnectConfig, errorText: string)
   const message = identityPath && !identityExists
     ? `SSH authentication failed while querying the cluster. The identity file ${identityPath} was not found. Update slurmConnect.identityFile to a valid key.`
     : identityPath
-      ? `SSH authentication failed while querying the cluster. Add ${identityPath} to your ssh-agent.`
+      ? agentStatus === 'unavailable'
+        ? `SSH authentication failed while querying the cluster. SSH agent is unavailable, enter the passphrase for ${identityPath} in the terminal.`
+        : `SSH authentication failed while querying the cluster. Add ${identityPath} to your ssh-agent or enter its passphrase in a terminal.`
       : 'SSH authentication failed while querying the cluster. Add your key to the ssh-agent (ssh-add <key>) or set slurmConnect.identityFile.';
   const choice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
-  if (choice === 'Open Terminal' && identityPath) {
+  const defaultMode: SshAuthMode = canAddToAgent ? 'agent' : 'terminal';
+  const mode: SshAuthMode = choice === 'Enter Passphrase in Terminal'
+    ? 'terminal'
+    : choice === 'Add to Agent'
+      ? 'agent'
+      : defaultMode;
+  lastSshAuthPrompt = { identityPath, timestamp: now, mode };
+  if (choice === 'Enter Passphrase in Terminal' && identityPath && identityExists && canTerminalPassphrase) {
+    return { kind: 'terminal' };
+  }
+  if (choice === 'Add to Agent' && identityPath && canAddToAgent) {
     const terminal = openSshAddTerminal(identityPath);
     const loaded = await vscode.window.withProgress(
       {
@@ -1398,41 +1879,48 @@ async function maybePromptForSshAuth(cfg: SlurmConnectConfig, errorText: string)
     );
     if (loaded) {
       terminal.dispose();
-      return true;
+      return { kind: 'agent' };
     }
     void vscode.window.showInformationMessage(
       'SSH key not detected in agent yet. Re-run Get cluster info after ssh-add completes.'
     );
-    return false;
+    return undefined;
   }
   if (choice === 'Open Settings') {
     void vscode.commands.executeCommand('workbench.action.openSettings', `${SETTINGS_SECTION}.identityFile`);
   }
-  return false;
+  return undefined;
 }
 
 async function runSshCommand(host: string, cfg: SlurmConnectConfig, command: string): Promise<string> {
-  const args: string[] = [];
-  if (cfg.sshQueryConfigPath) {
-    args.push('-F', expandHome(cfg.sshQueryConfigPath));
-  }
-  args.push('-T', '-o', 'BatchMode=yes', '-o', `ConnectTimeout=${cfg.sshConnectTimeoutSeconds}`);
-  if (cfg.identityFile) {
-    args.push('-i', expandHome(cfg.identityFile));
-  }
-  const target = cfg.user ? `${cfg.user}@${host}` : host;
-  args.push(target, command);
+  const args = buildSshArgs(host, cfg, command, { batchMode: true });
 
   try {
     const { stdout } = await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
     return stdout.trim();
   } catch (error) {
     const errorText = normalizeSshErrorText(error);
-    const shouldRetry = await maybePromptForSshAuth(cfg, errorText);
-    if (shouldRetry) {
+    const retry = await maybePromptForSshAuth(cfg, errorText);
+    if (retry?.kind === 'agent') {
       try {
         const { stdout } = await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
         return stdout.trim();
+      } catch (retryError) {
+        const retryText = normalizeSshErrorText(retryError);
+        const retrySummary = pickSshErrorSummary(retryText);
+        throw new Error(retrySummary || 'SSH command failed');
+      }
+    }
+    if (retry?.kind === 'terminal') {
+      try {
+        return await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: 'Waiting for SSH passphrase in terminal',
+            cancellable: false
+          },
+          async () => await runSshCommandInTerminal(host, cfg, command)
+        );
       } catch (retryError) {
         const retryText = normalizeSshErrorText(retryError);
         const retrySummary = pickSshErrorSummary(retryText);
@@ -1734,8 +2222,166 @@ async function restoreRemoteSshConfigIfNeeded(): Promise<boolean> {
   return true;
 }
 
+function resolveWindowsUserSettingsPath(): string | undefined {
+  const appData = process.env.APPDATA;
+  if (!appData) {
+    return undefined;
+  }
+  const appName = vscode.env.appName || '';
+  const normalized = appName.toLowerCase();
+  let folderName = 'Code';
+  if (normalized.includes('insiders')) {
+    folderName = 'Code - Insiders';
+  } else if (normalized.includes('oss')) {
+    folderName = 'Code - OSS';
+  } else if (normalized.includes('vscodium')) {
+    folderName = 'VSCodium';
+  }
+  return path.join(appData, folderName, 'User', 'settings.json');
+}
+
+function detectJsonFormattingOptions(text: string): jsonc.FormattingOptions {
+  const eol = text.includes('\r\n') ? '\r\n' : text.includes('\n') ? '\n' : os.EOL;
+  const indentMatch = text.match(/^[ \t]+(?="[^"]+")/m);
+  if (indentMatch) {
+    const indent = indentMatch[0];
+    const usesTabs = indent.includes('\t');
+    return {
+      insertSpaces: !usesTabs,
+      tabSize: usesTabs ? 1 : indent.length,
+      eol
+    };
+  }
+  return { insertSpaces: true, tabSize: 2, eol };
+}
+
+async function readUserSettingsText(settingsPath: string): Promise<string> {
+  try {
+    return await fs.readFile(settingsPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return '';
+    }
+    throw error;
+  }
+}
+
+async function userSettingsHasKey(settingsPath: string, key: string): Promise<boolean> {
+  const text = await readUserSettingsText(settingsPath);
+  if (text.trim().length === 0) {
+    return false;
+  }
+  const errors: jsonc.ParseError[] = [];
+  const data = jsonc.parse(text, errors, {
+    allowTrailingComma: true,
+    disallowComments: false
+  });
+  if (errors.length > 0) {
+    throw new Error('Unable to parse user settings JSON.');
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('User settings JSON is not an object.');
+  }
+  return Object.prototype.hasOwnProperty.call(data as Record<string, unknown>, key);
+}
+
+async function addSettingToUserSettingsJson(
+  settingsPath: string,
+  key: string,
+  value: boolean
+): Promise<void> {
+  const text = await readUserSettingsText(settingsPath);
+  const errors: jsonc.ParseError[] = [];
+  if (text.trim().length > 0) {
+    jsonc.parse(text, errors, {
+      allowTrailingComma: true,
+      disallowComments: false
+    });
+  }
+  if (errors.length > 0) {
+    throw new Error('Unable to parse user settings JSON.');
+  }
+  const edits = jsonc.modify(text, [key], value, {
+    formattingOptions: detectJsonFormattingOptions(text)
+  });
+  if (edits.length === 0) {
+    return;
+  }
+  const updated = jsonc.applyEdits(text, edits);
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+  await fs.writeFile(settingsPath, updated, 'utf8');
+}
+
+async function ensureLocalServerSetting(): Promise<void> {
+  const platform = os.platform();
+  const osVersion = typeof os.version === 'function' ? os.version() : os.release();
+  const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
+
+  if (platform === 'win32') {
+    const settingsPath = resolveWindowsUserSettingsPath();
+    if (!settingsPath) {
+      void vscode.window.showWarningMessage(
+        'Slurm Connect could not locate your Windows user settings.json file. Please add "remote.SSH.useLocalServer": true manually.'
+      );
+      return;
+    }
+    try {
+      const hasKey = await userSettingsHasKey(settingsPath, 'remote.SSH.useLocalServer');
+      if (hasKey) {
+        return;
+      }
+    } catch (error) {
+      void vscode.window.showWarningMessage(
+        `Slurm Connect could not read ${settingsPath}. Please add "remote.SSH.useLocalServer": true manually. (${formatError(error)})`
+      );
+      return;
+    }
+
+    const action = await vscode.window.showInformationMessage(
+      `Slurm Connect detected ${platform} (${osVersion}). To work around a Remote-SSH issue, it can add "remote.SSH.useLocalServer": true to ${settingsPath}.`,
+      'Add Setting',
+      'Not Now'
+    );
+    if (action !== 'Add Setting') {
+      return;
+    }
+
+    try {
+      await addSettingToUserSettingsJson(settingsPath, 'remote.SSH.useLocalServer', true);
+    } catch (error) {
+      void vscode.window.showWarningMessage(
+        `Failed to update ${settingsPath} with remote.SSH.useLocalServer: ${formatError(error)}`
+      );
+    }
+    return;
+  }
+
+  const inspection = remoteCfg.inspect<boolean>('useLocalServer');
+  if (!inspection || inspection.globalValue !== undefined) {
+    return;
+  }
+
+  const action = await vscode.window.showInformationMessage(
+    `Slurm Connect detected ${platform} (${osVersion}). To work around a Remote-SSH issue, it can add "remote.SSH.useLocalServer": true to your user settings.`,
+    'Add Setting',
+    'Not Now'
+  );
+  if (action !== 'Add Setting') {
+    return;
+  }
+
+  try {
+    await remoteCfg.update('useLocalServer', true, vscode.ConfigurationTarget.Global);
+  } catch (error) {
+    void vscode.window.showWarningMessage(
+      `Failed to update user settings with remote.SSH.useLocalServer: ${formatError(error)}`
+    );
+  }
+}
+
 
 async function ensureRemoteSshSettings(): Promise<void> {
+  await ensureLocalServerSetting();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const enableRemoteCommand = remoteCfg.get<boolean>('enableRemoteCommand', false);
   if (!enableRemoteCommand) {
@@ -1932,9 +2578,27 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
   return false;
 }
 
-function getUiValuesFromConfig(cfg: SlurmConnectConfig): UiValues {
+function hasCachedUiValue(cache: ClusterUiCache | undefined, key: keyof UiValues): boolean {
+  return Boolean(cache && Object.prototype.hasOwnProperty.call(cache, key));
+}
+
+function getCachedUiValue<T extends keyof UiValues>(
+  cache: ClusterUiCache | undefined,
+  key: T
+): UiValues[T] | undefined {
+  if (!hasCachedUiValue(cache, key)) {
+    return undefined;
+  }
+  return cache?.[key];
+}
+
+function getUiValuesFromStorage(): UiValues {
+  return getUiValuesFromConfig(getConfigFromSettings(), getMergedClusterUiCache());
+}
+
+function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache): UiValues {
   const config = vscode.workspace.getConfiguration(SETTINGS_SECTION);
-  const hasValue = (key: string): boolean => {
+  const hasConfigValue = (key: string): boolean => {
     const inspected = config.inspect(key);
     if (!inspected) {
       return false;
@@ -1945,37 +2609,49 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig): UiValues {
       inspected.globalValue !== undefined
     );
   };
-  const hasDefaultPartition = hasValue('defaultPartition');
-  const hasDefaultNodes = hasValue('defaultNodes');
-  const hasDefaultTasksPerNode = hasValue('defaultTasksPerNode');
-  const hasDefaultCpusPerTask = hasValue('defaultCpusPerTask');
-  const hasDefaultTime = hasValue('defaultTime');
-  const hasDefaultMemoryMb = hasValue('defaultMemoryMb');
-  const hasDefaultGpuType = hasValue('defaultGpuType');
-  const hasDefaultGpuCount = hasValue('defaultGpuCount');
+  const hasValue = (key: string, cacheKey?: keyof UiValues): boolean =>
+    hasConfigValue(key) || (cacheKey ? hasCachedUiValue(cache, cacheKey) : false);
+  const fromCache = <T extends keyof UiValues>(key: T, fallback: UiValues[T]): UiValues[T] => {
+    const cached = getCachedUiValue(cache, key);
+    return cached !== undefined ? cached : fallback;
+  };
+  const hasDefaultPartition = hasValue('defaultPartition', 'defaultPartition');
+  const hasDefaultNodes = hasValue('defaultNodes', 'defaultNodes');
+  const hasDefaultTasksPerNode = hasValue('defaultTasksPerNode', 'defaultTasksPerNode');
+  const hasDefaultCpusPerTask = hasValue('defaultCpusPerTask', 'defaultCpusPerTask');
+  const hasDefaultTime = hasValue('defaultTime', 'defaultTime');
+  const hasDefaultMemoryMb = hasValue('defaultMemoryMb', 'defaultMemoryMb');
+  const hasDefaultGpuType = hasValue('defaultGpuType', 'defaultGpuType');
+  const hasDefaultGpuCount = hasValue('defaultGpuCount', 'defaultGpuCount');
   return {
-    loginHosts: cfg.loginHosts.join('\n'),
-    loginHostsCommand: cfg.loginHostsCommand || '',
-    loginHostsQueryHost: cfg.loginHostsQueryHost || '',
-    partitionCommand: cfg.partitionCommand || '',
-    partitionInfoCommand: cfg.partitionInfoCommand || '',
-    qosCommand: cfg.qosCommand || '',
-    accountCommand: cfg.accountCommand || '',
-    user: cfg.user || '',
-    identityFile: cfg.identityFile || '',
-    moduleLoad: cfg.moduleLoad || '',
-    proxyCommand: cfg.proxyCommand || '',
-    proxyArgs: cfg.proxyArgs.join('\n'),
-    extraSallocArgs: cfg.extraSallocArgs.join('\n'),
+    loginHosts: fromCache('loginHosts', cfg.loginHosts.join('\n')),
+    loginHostsCommand: fromCache('loginHostsCommand', cfg.loginHostsCommand || ''),
+    loginHostsQueryHost: fromCache('loginHostsQueryHost', cfg.loginHostsQueryHost || ''),
+    partitionCommand: fromCache('partitionCommand', cfg.partitionCommand || ''),
+    partitionInfoCommand: fromCache('partitionInfoCommand', cfg.partitionInfoCommand || ''),
+    qosCommand: fromCache('qosCommand', cfg.qosCommand || ''),
+    accountCommand: fromCache('accountCommand', cfg.accountCommand || ''),
+    user: fromCache('user', cfg.user || ''),
+    identityFile: fromCache('identityFile', cfg.identityFile || ''),
+    moduleLoad: fromCache('moduleLoad', cfg.moduleLoad || ''),
+    moduleSelections: getCachedUiValue(cache, 'moduleSelections'),
+    moduleCustomCommand: getCachedUiValue(cache, 'moduleCustomCommand'),
+    proxyCommand: fromCache('proxyCommand', cfg.proxyCommand || ''),
+    proxyArgs: fromCache('proxyArgs', cfg.proxyArgs.join('\n')),
+    extraSallocArgs: fromCache('extraSallocArgs', cfg.extraSallocArgs.join('\n')),
     promptForExtraSallocArgs: cfg.promptForExtraSallocArgs,
-    defaultPartition: hasDefaultPartition ? (cfg.defaultPartition || '') : '',
-    defaultNodes: hasDefaultNodes && cfg.defaultNodes ? String(cfg.defaultNodes) : '',
-    defaultTasksPerNode: hasDefaultTasksPerNode && cfg.defaultTasksPerNode ? String(cfg.defaultTasksPerNode) : '',
-    defaultCpusPerTask: hasDefaultCpusPerTask && cfg.defaultCpusPerTask ? String(cfg.defaultCpusPerTask) : '',
-    defaultTime: hasDefaultTime ? (cfg.defaultTime || '') : '',
-    defaultMemoryMb: hasDefaultMemoryMb && cfg.defaultMemoryMb ? String(cfg.defaultMemoryMb) : '',
-    defaultGpuType: hasDefaultGpuType ? (cfg.defaultGpuType || '') : '',
-    defaultGpuCount: hasDefaultGpuCount && cfg.defaultGpuCount ? String(cfg.defaultGpuCount) : '',
+    defaultPartition: hasDefaultPartition ? fromCache('defaultPartition', cfg.defaultPartition || '') : '',
+    defaultNodes: hasDefaultNodes ? fromCache('defaultNodes', String(cfg.defaultNodes || '')) : '',
+    defaultTasksPerNode: hasDefaultTasksPerNode
+      ? fromCache('defaultTasksPerNode', String(cfg.defaultTasksPerNode || ''))
+      : '',
+    defaultCpusPerTask: hasDefaultCpusPerTask
+      ? fromCache('defaultCpusPerTask', String(cfg.defaultCpusPerTask || ''))
+      : '',
+    defaultTime: hasDefaultTime ? fromCache('defaultTime', cfg.defaultTime || '') : '',
+    defaultMemoryMb: hasDefaultMemoryMb ? fromCache('defaultMemoryMb', String(cfg.defaultMemoryMb || '')) : '',
+    defaultGpuType: hasDefaultGpuType ? fromCache('defaultGpuType', cfg.defaultGpuType || '') : '',
+    defaultGpuCount: hasDefaultGpuCount ? fromCache('defaultGpuCount', String(cfg.defaultGpuCount || '')) : '',
     sshHostPrefix: cfg.sshHostPrefix || '',
     forwardAgent: cfg.forwardAgent,
     requestTTY: cfg.requestTTY,
@@ -1991,28 +2667,7 @@ async function updateConfigFromUi(values: UiValues, target: vscode.Configuration
   const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
 
   const updates: Array<[string, unknown]> = [
-    ['loginHosts', parseListInput(values.loginHosts)],
-    ['loginHostsCommand', values.loginHostsCommand.trim()],
-    ['loginHostsQueryHost', values.loginHostsQueryHost.trim()],
-    ['partitionCommand', values.partitionCommand.trim()],
-    ['partitionInfoCommand', values.partitionInfoCommand.trim()],
-    ['qosCommand', values.qosCommand.trim()],
-    ['accountCommand', values.accountCommand.trim()],
-    ['user', values.user.trim()],
-    ['identityFile', values.identityFile.trim()],
-    ['moduleLoad', values.moduleLoad.trim()],
-    ['proxyCommand', values.proxyCommand.trim()],
-    ['proxyArgs', parseListInput(values.proxyArgs)],
-    ['extraSallocArgs', parseListInput(values.extraSallocArgs)],
     ['promptForExtraSallocArgs', Boolean(values.promptForExtraSallocArgs)],
-    ['defaultPartition', values.defaultPartition.trim()],
-    ['defaultNodes', parsePositiveNumberInput(values.defaultNodes)],
-    ['defaultTasksPerNode', parsePositiveNumberInput(values.defaultTasksPerNode)],
-    ['defaultCpusPerTask', parsePositiveNumberInput(values.defaultCpusPerTask)],
-    ['defaultTime', values.defaultTime.trim()],
-    ['defaultMemoryMb', parseNonNegativeNumberInput(values.defaultMemoryMb)],
-    ['defaultGpuType', values.defaultGpuType.trim()],
-    ['defaultGpuCount', parseNonNegativeNumberInput(values.defaultGpuCount)],
     ['sshHostPrefix', values.sshHostPrefix.trim()],
     ['forwardAgent', Boolean(values.forwardAgent)],
     ['requestTTY', Boolean(values.requestTTY)],
@@ -2026,6 +2681,41 @@ async function updateConfigFromUi(values: UiValues, target: vscode.Configuration
   for (const [key, value] of updates) {
     await cfg.update(key, value, target);
   }
+
+  await updateClusterUiCache(values, target);
+}
+
+function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConnectConfig> {
+  const overrides: Partial<SlurmConnectConfig> = {};
+  const has = (key: keyof ClusterUiCache): boolean => Object.prototype.hasOwnProperty.call(values, key);
+
+  if (has('loginHosts')) overrides.loginHosts = parseListInput(String(values.loginHosts ?? ''));
+  if (has('loginHostsCommand')) overrides.loginHostsCommand = String(values.loginHostsCommand ?? '').trim();
+  if (has('loginHostsQueryHost')) overrides.loginHostsQueryHost = String(values.loginHostsQueryHost ?? '').trim();
+  if (has('partitionCommand')) overrides.partitionCommand = String(values.partitionCommand ?? '').trim();
+  if (has('partitionInfoCommand')) overrides.partitionInfoCommand = String(values.partitionInfoCommand ?? '').trim();
+  if (has('qosCommand')) overrides.qosCommand = String(values.qosCommand ?? '').trim();
+  if (has('accountCommand')) overrides.accountCommand = String(values.accountCommand ?? '').trim();
+  if (has('user')) overrides.user = String(values.user ?? '').trim();
+  if (has('identityFile')) overrides.identityFile = String(values.identityFile ?? '').trim();
+  if (has('moduleLoad')) overrides.moduleLoad = String(values.moduleLoad ?? '').trim();
+  if (has('proxyCommand')) overrides.proxyCommand = String(values.proxyCommand ?? '').trim();
+  if (has('proxyArgs')) overrides.proxyArgs = parseListInput(String(values.proxyArgs ?? ''));
+  if (has('extraSallocArgs')) overrides.extraSallocArgs = parseListInput(String(values.extraSallocArgs ?? ''));
+  if (has('defaultPartition')) overrides.defaultPartition = String(values.defaultPartition ?? '').trim();
+  if (has('defaultNodes')) overrides.defaultNodes = parsePositiveNumberInput(String(values.defaultNodes ?? ''));
+  if (has('defaultTasksPerNode')) {
+    overrides.defaultTasksPerNode = parsePositiveNumberInput(String(values.defaultTasksPerNode ?? ''));
+  }
+  if (has('defaultCpusPerTask')) {
+    overrides.defaultCpusPerTask = parsePositiveNumberInput(String(values.defaultCpusPerTask ?? ''));
+  }
+  if (has('defaultTime')) overrides.defaultTime = String(values.defaultTime ?? '').trim();
+  if (has('defaultMemoryMb')) overrides.defaultMemoryMb = parseNonNegativeNumberInput(String(values.defaultMemoryMb ?? ''));
+  if (has('defaultGpuType')) overrides.defaultGpuType = String(values.defaultGpuType ?? '').trim();
+  if (has('defaultGpuCount')) overrides.defaultGpuCount = parseNonNegativeNumberInput(String(values.defaultGpuCount ?? ''));
+
+  return overrides;
 }
 
 function uniqueList(values: string[]): string[] {
@@ -2272,6 +2962,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="user" type="text" />
     <label for="identityFile">Identity file</label>
     <input id="identityFile" type="text" />
+    <div id="agentStatus" class="hint"></div>
     <div class="buttons" style="margin-top: 8px;">
       <button id="getClusterInfo">Get cluster info</button>
       <button id="clearClusterInfo">Clear cluster info</button>
@@ -2500,6 +3191,13 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     function setProfileStatus(text, isError) {
       const el = document.getElementById('profileStatus');
+      if (!el) return;
+      el.textContent = text || '';
+      el.style.color = isError ? '#b00020' : '#555';
+    }
+
+    function setAgentStatus(text, isError) {
+      const el = document.getElementById('agentStatus');
       if (!el) return;
       el.textContent = text || '';
       el.style.color = isError ? '#b00020' : '#555';
@@ -3222,6 +3920,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (message.profileStatus) {
         setProfileStatus(message.profileStatus, Boolean(message.profileError));
       }
+      if (message.agentStatus) {
+        setAgentStatus(message.agentStatus, Boolean(message.agentStatusError));
+      }
     }
 
     window.addEventListener('message', (event) => {
@@ -3231,6 +3932,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
         const values = message.values || {};
         lastValues = values;
         Object.keys(values).forEach((key) => setValue(key, values[key]));
+        const saveTarget = document.getElementById('saveTarget');
+        if (saveTarget && message.saveTarget) {
+          saveTarget.value = message.saveTarget;
+        }
         applyModuleState(values);
         if (message.clusterInfo) {
           applyClusterInfo(message.clusterInfo);
