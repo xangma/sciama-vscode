@@ -5,6 +5,7 @@ This extension helps users allocate Slurm resources on a cluster and connect VS 
 ## Requirements
 - VS Code with **Remote - SSH** installed.
 - SSH keys configured for the cluster (agent forwarding recommended).
+- Python 3.9+ available on the login nodes.
 - `vscode-shell-proxy.py` available on the login nodes (via module load or PATH).
 - ssh-agent running with your key added.
 
@@ -48,6 +49,16 @@ python /usr/bin/vscode-shell-proxy.py
 ```
 
 Remote-SSH needs the proxy to attach to the compute allocation. If your cluster uses a different path or script name, update `slurmConnect.proxyCommand` accordingly.
+
+If you're installing/using this on a different cluster, make sure the proxy script is accessible and the login nodes have Python 3.9+:
+```
+https://github.com/xangma/vscode-shell-proxy/blob/main/vscode-shell-proxy.py
+```
+The "slurmConnect.proxyCommand" setting must execute it, e.g.:
+
+```json
+"slurmConnect.proxyCommand": "python /usr/bin/vscode-shell-proxy.py"
+```
 
 ### Remote folder (recommended)
 If you forget to set a remote folder, VS Code may reconnect and create a new Slurm job when you later open a folder. To avoid that, you should set a remote folder up front:
@@ -94,6 +105,13 @@ The command should output hostnames separated by whitespace or newlines.
 - Use `slurmConnect.openInNewWindow` to control whether the connection opens in a new window (default: false).
 - `slurmConnect.partitionInfoCommand` controls how cluster info is fetched (default: `sinfo -h -N -o "%P|%n|%c|%m|%G"`).
 - To add GPUs or other flags, use `slurmConnect.extraSallocArgs` (e.g. `["--gres=gpu:1"]`).
+
+## Issues
+Please report bugs and feature requests on the GitHub repository:
+```
+https://github.com/xangma/slurm-connect
+```
+
 
 ## Development
 1. Install dependencies:
