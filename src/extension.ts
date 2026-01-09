@@ -583,6 +583,25 @@ function postToWebview(message: unknown): void {
   void activeWebview.postMessage(message);
 }
 
+async function openSlurmConnectView(): Promise<void> {
+  try {
+    await vscode.commands.executeCommand('workbench.view.extension.slurmConnect');
+  } catch {
+    // Ignore if the view cannot be opened.
+  }
+}
+
+async function refreshAgentStatus(identityFile: string): Promise<void> {
+  if (!activeWebview) {
+    return;
+  }
+  const agentStatus = await buildAgentStatusMessage(identityFile);
+  postToWebview({
+    agentStatus: agentStatus.text,
+    agentStatusError: agentStatus.isError
+  });
+}
+
 function setConnectionState(state: ConnectionState): void {
   connectionState = state;
   postToWebview({ command: 'connectionState', state });
@@ -1094,6 +1113,8 @@ async function connectCommand(
     return false;
   }
 
+  await maybePromptForSshAuthOnConnect(cfg, loginHost);
+
   let partition: string | undefined;
   let qos: string | undefined;
   let account: string | undefined;
@@ -1444,9 +1465,15 @@ async function fetchClusterInfo(loginHost: string, cfg: SlurmConnectConfig): Pro
     'sinfo -h -o "%P|%D|%c|%m|%G"'
   ].filter(Boolean);
 
+  const log = getOutputChannel();
+  try {
+    return await fetchClusterInfoSingleCall(loginHost, cfg, commands);
+  } catch (error) {
+    log.appendLine(`Single-call cluster info failed, falling back. ${formatError(error)}`);
+  }
+
   let lastInfo: ClusterInfo = { partitions: [] };
   let bestInfo: ClusterInfo | undefined;
-  const log = getOutputChannel();
   for (const command of commands) {
     log.appendLine(`Cluster info command: ${command}`);
     const output = await runSshCommand(loginHost, cfg, command);
@@ -1471,6 +1498,139 @@ async function fetchClusterInfo(loginHost: string, cfg: SlurmConnectConfig): Pro
   const info = bestInfo ?? lastInfo;
   const modules = await queryAvailableModules(loginHost, cfg);
   info.modules = modules;
+  return info;
+}
+
+const CLUSTER_CMD_START = '__SC_CMD_START__';
+const CLUSTER_CMD_END = '__SC_CMD_END__';
+const CLUSTER_MODULES_START = '__SC_MODULES_START__';
+const CLUSTER_MODULES_END = '__SC_MODULES_END__';
+
+function buildCombinedClusterInfoCommand(commands: string[]): string {
+  const encodedCommands = commands.map((command) => Buffer.from(command, 'utf8').toString('base64'));
+  const commandArray = encodedCommands.map((encoded) => `'${encoded}'`).join(' ');
+  const script = [
+    'set +e',
+    `cmds=(${commandArray})`,
+    'i=0',
+    'for b64 in "${cmds[@]}"; do',
+    `  echo "${CLUSTER_CMD_START}\${i}__"`,
+    '  cmd=$(printf %s "$b64" | base64 -d)',
+    '  eval "$cmd"',
+    `  echo "${CLUSTER_CMD_END}\${i}__"`,
+    '  i=$((i+1))',
+    'done',
+    `echo "${CLUSTER_MODULES_START}"`,
+    'modules=$(module -t avail 2>&1)',
+    'status=$?',
+    'if [ $status -ne 0 ] || echo "$modules" | grep -qi "command not found\\|module: not found"; then',
+    '  modules=$(bash -lc "module -t avail 2>&1")',
+    'fi',
+    'printf "%s\\n" "$modules"',
+    `echo "${CLUSTER_MODULES_END}"`
+  ].join('\n');
+
+  const encodedScript = Buffer.from(script, 'utf8').toString('base64');
+  return `bash -lc 'printf %s ${encodedScript} | base64 -d | bash'`;
+}
+
+function parseCombinedClusterInfoOutput(
+  output: string,
+  commandCount: number
+): { commandOutputs: string[]; modulesOutput: string } {
+  const commandOutputs: string[] = Array.from({ length: commandCount }, () => '');
+  let currentIndex: number | null = null;
+  let inModules = false;
+  const moduleLines: string[] = [];
+  const lines = output.split(/\r?\n/);
+
+  for (const line of lines) {
+    if (line === CLUSTER_MODULES_START) {
+      inModules = true;
+      currentIndex = null;
+      continue;
+    }
+    if (line === CLUSTER_MODULES_END) {
+      inModules = false;
+      continue;
+    }
+    if (line.startsWith(CLUSTER_CMD_START)) {
+      const raw = line.slice(CLUSTER_CMD_START.length);
+      const match = raw.match(/^(\d+)__$/);
+      currentIndex = match ? Number(match[1]) : null;
+      continue;
+    }
+    if (line.startsWith(CLUSTER_CMD_END)) {
+      currentIndex = null;
+      continue;
+    }
+    if (inModules) {
+      moduleLines.push(line);
+      continue;
+    }
+    if (currentIndex !== null && currentIndex >= 0 && currentIndex < commandOutputs.length) {
+      commandOutputs[currentIndex] += line + '\n';
+    }
+  }
+
+  return {
+    commandOutputs: commandOutputs.map((text) => text.trim()),
+    modulesOutput: moduleLines.join('\n').trim()
+  };
+}
+
+function parseModulesOutput(output: string): string[] {
+  if (!output) {
+    return [];
+  }
+  const lowered = output.toLowerCase();
+  if (lowered.includes('command not found') || lowered.includes('module: not found')) {
+    return [];
+  }
+  return parseSimpleList(output);
+}
+
+async function fetchClusterInfoSingleCall(
+  loginHost: string,
+  cfg: SlurmConnectConfig,
+  commands: string[]
+): Promise<ClusterInfo> {
+  const log = getOutputChannel();
+  const combinedCommand = buildCombinedClusterInfoCommand(commands);
+  log.appendLine(`Cluster info single-call command: ${combinedCommand}`);
+  const output = await runSshCommand(loginHost, cfg, combinedCommand);
+  const { commandOutputs, modulesOutput } = parseCombinedClusterInfoOutput(output, commands.length);
+
+  let lastInfo: ClusterInfo = { partitions: [] };
+  let bestInfo: ClusterInfo | undefined;
+  for (let i = 0; i < commandOutputs.length; i += 1) {
+    const cmdOutput = commandOutputs[i];
+    if (!cmdOutput) {
+      continue;
+    }
+    const info = parsePartitionInfoOutput(cmdOutput);
+    lastInfo = info;
+    const maxFields = getMaxFieldCount(cmdOutput);
+    const outputHasGpu = cmdOutput.includes('gpu:');
+    const hasGpu = info.partitions.some((partition) => partition.gpuMax > 0);
+    log.appendLine(
+      `Cluster info fields: ${maxFields}, partitions: ${info.partitions.length}, outputHasGpu: ${outputHasGpu}, hasGpu: ${hasGpu}`
+    );
+    if (outputHasGpu && !hasGpu) {
+      log.appendLine('GPU data present but parse yielded none; trying next command.');
+      continue;
+    }
+    if (maxFields < 5) {
+      continue;
+    }
+    if (hasMeaningfulClusterInfo(info)) {
+      bestInfo = info;
+      break;
+    }
+  }
+
+  const info = bestInfo ?? lastInfo;
+  info.modules = parseModulesOutput(modulesOutput);
   return info;
 }
 
@@ -1545,6 +1705,21 @@ function quoteShellArg(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
+function quotePowerShellString(value: string): string {
+  return "'" + value.replace(/'/g, "''") + "'";
+}
+
+function normalizeRemoteCommandForWindowsTerminal(command: string): string {
+  if (!command.includes('"')) {
+    return command;
+  }
+  const quotedSegments = command.match(/"[^"]*"/g);
+  if (quotedSegments && quotedSegments.some((segment) => segment.includes("'"))) {
+    return command;
+  }
+  return command.replace(/"/g, "'");
+}
+
 async function createTerminalSshRunFiles(): Promise<{
   dirPath: string;
   stdoutPath: string;
@@ -1582,13 +1757,34 @@ async function runSshCommandInTerminal(
   cfg: SlurmConnectConfig,
   command: string
 ): Promise<string> {
-  if (process.platform === 'win32') {
-    throw new Error('Terminal passphrase prompt is not supported on Windows.');
-  }
-  const args = buildSshArgs(host, cfg, command, { batchMode: false });
+  const normalizedCommand =
+    process.platform === 'win32' ? normalizeRemoteCommandForWindowsTerminal(command) : command;
+  const args = buildSshArgs(host, cfg, normalizedCommand, { batchMode: false });
   const { dirPath, stdoutPath, statusPath } = await createTerminalSshRunFiles();
-  const sshCommand = ['ssh', ...args].map(quoteShellArg).join(' ');
-  const shellCommand = `${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
+  const isWindows = process.platform === 'win32';
+  const shellCommand = isWindows
+    ? (() => {
+        const psArgs = args.map((arg) => quotePowerShellString(arg)).join(', ');
+        const psScript = [
+          "$ErrorActionPreference = 'Continue'",
+          `$stdoutPath = ${quotePowerShellString(stdoutPath)}`,
+          `$statusPath = ${quotePowerShellString(statusPath)}`,
+          '$exitCode = 1',
+          'try {',
+          `  & ssh @(${psArgs}) | Out-File -FilePath $stdoutPath -Encoding utf8`,
+          '  $exitCode = $LASTEXITCODE',
+          '} catch {',
+          '  $exitCode = 1',
+          '}',
+          '$exitCode | Out-File -FilePath $statusPath -Encoding ascii -NoNewline'
+        ].join('; ');
+        const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+        return `powershell -NoProfile -EncodedCommand ${encoded}`;
+      })()
+    : (() => {
+        const sshCommand = ['ssh', ...args].map(quoteShellArg).join(' ');
+        return `${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
+      })();
   const terminal = vscode.window.createTerminal({ name: 'Slurm Connect SSH' });
   terminal.show(true);
   terminal.sendText(shellCommand, true);
@@ -1816,7 +2012,7 @@ async function maybePromptForSshAuth(
   }
   const identityPath = cfg.identityFile ? expandHome(cfg.identityFile) : '';
   const identityExists = identityPath ? await fileExists(identityPath) : false;
-  const canTerminalPassphrase = process.platform !== 'win32' && Boolean(identityPath && identityExists);
+  const canTerminalPassphrase = Boolean(identityPath && identityExists);
   const agentInfo = identityPath && identityExists ? await getSshAgentInfo() : undefined;
   if (identityPath && identityExists && agentInfo?.status === 'available') {
     if (await isSshKeyListedInAgentOutput(identityPath, agentInfo.output)) {
@@ -1846,16 +2042,16 @@ async function maybePromptForSshAuth(
     actions.push('Add to Agent');
   }
   if (!identityPath || !identityExists) {
-    actions.push('Open Settings');
+    actions.push('Open Slurm Connect');
   }
   actions.push('Dismiss');
   const message = identityPath && !identityExists
-    ? `SSH authentication failed while querying the cluster. The identity file ${identityPath} was not found. Update slurmConnect.identityFile to a valid key.`
+    ? `SSH authentication failed while querying the cluster. The identity file ${identityPath} was not found. Update it in the Slurm Connect view.`
     : identityPath
       ? agentStatus === 'unavailable'
         ? `SSH authentication failed while querying the cluster. SSH agent is unavailable, enter the passphrase for ${identityPath} in the terminal.`
         : `SSH authentication failed while querying the cluster. Add ${identityPath} to your ssh-agent or enter its passphrase in a terminal.`
-      : 'SSH authentication failed while querying the cluster. Add your key to the ssh-agent (ssh-add <key>) or set slurmConnect.identityFile.';
+      : 'SSH authentication failed while querying the cluster. Add your key to the ssh-agent (ssh-add <key>) or set your identity file in the Slurm Connect view.';
   const choice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
   const defaultMode: SshAuthMode = canAddToAgent ? 'agent' : 'terminal';
   const mode: SshAuthMode = choice === 'Enter Passphrase in Terminal'
@@ -1879,6 +2075,7 @@ async function maybePromptForSshAuth(
     );
     if (loaded) {
       terminal.dispose();
+      await refreshAgentStatus(cfg.identityFile);
       return { kind: 'agent' };
     }
     void vscode.window.showInformationMessage(
@@ -1886,10 +2083,82 @@ async function maybePromptForSshAuth(
     );
     return undefined;
   }
-  if (choice === 'Open Settings') {
-    void vscode.commands.executeCommand('workbench.action.openSettings', `${SETTINGS_SECTION}.identityFile`);
+  if (choice === 'Open Slurm Connect') {
+    await openSlurmConnectView();
   }
   return undefined;
+}
+
+async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost: string): Promise<void> {
+  const identityPath = cfg.identityFile ? expandHome(cfg.identityFile) : '';
+  if (!identityPath) {
+    return;
+  }
+  const identityExists = await fileExists(identityPath);
+  const agentInfo = identityExists ? await getSshAgentInfo() : undefined;
+  if (identityExists && agentInfo?.status === 'available') {
+    const loaded = await isSshKeyListedInAgentOutput(identityPath, agentInfo.output);
+    if (loaded) {
+      return;
+    }
+  }
+  if (identityExists && agentInfo?.status === 'unavailable') {
+    // Remote-SSH will handle passphrase prompts during connect.
+    return;
+  }
+
+  const now = Date.now();
+  if (lastSshAuthPrompt) {
+    const sameIdentity = lastSshAuthPrompt.identityPath === identityPath;
+    const recentlyPrompted = now - lastSshAuthPrompt.timestamp < 60_000;
+    if (sameIdentity && recentlyPrompted) {
+      return;
+    }
+  }
+
+  const canAddToAgent = Boolean(identityExists && agentInfo?.status === 'available');
+
+  const actions: string[] = [];
+  if (canAddToAgent) {
+    actions.push('Add to Agent');
+  }
+  if (!identityExists) {
+    actions.push('Open Slurm Connect');
+  }
+  actions.push('Dismiss');
+
+  const message = !identityExists
+    ? `SSH identity file ${identityPath} was not found. Update it in the Slurm Connect view.`
+    : `SSH key is not loaded in the agent. Add ${identityPath} to avoid extra prompts.`;
+
+  const choice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
+  const mode: SshAuthMode = choice === 'Add to Agent' ? 'agent' : 'terminal';
+  lastSshAuthPrompt = { identityPath, timestamp: now, mode };
+
+  if (choice === 'Add to Agent' && canAddToAgent) {
+    const terminal = openSshAddTerminal(identityPath);
+    const loaded = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: 'Waiting for ssh-add to load the key',
+        cancellable: false
+      },
+      async () => await waitForSshKeyLoaded(identityPath, 180_000, 1500)
+    );
+    if (loaded) {
+      terminal.dispose();
+      await refreshAgentStatus(cfg.identityFile);
+    } else {
+      void vscode.window.showInformationMessage(
+        'SSH key not detected in agent yet. Continue once ssh-add completes.'
+      );
+    }
+    return;
+  }
+
+  if (choice === 'Open Slurm Connect') {
+    await openSlurmConnectView();
+  }
 }
 
 async function runSshCommand(host: string, cfg: SlurmConnectConfig, command: string): Promise<string> {
@@ -2316,6 +2585,7 @@ async function ensureLocalServerSetting(): Promise<void> {
   const platform = os.platform();
   const osVersion = typeof os.version === 'function' ? os.version() : os.release();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
+  const useLocalServer = remoteCfg.get<boolean>('useLocalServer', false);
 
   if (platform === 'win32') {
     const settingsPath = resolveWindowsUserSettingsPath();
@@ -2325,9 +2595,27 @@ async function ensureLocalServerSetting(): Promise<void> {
       );
       return;
     }
+    if (useLocalServer) {
+      return;
+    }
     try {
       const hasKey = await userSettingsHasKey(settingsPath, 'remote.SSH.useLocalServer');
-      if (hasKey) {
+      if (!hasKey) {
+        const action = await vscode.window.showInformationMessage(
+          `Slurm Connect detected ${platform} (${osVersion}). To work around a Remote-SSH issue, it can add "remote.SSH.useLocalServer": true to ${settingsPath}.`,
+          'Add Setting',
+          'Not Now'
+        );
+        if (action !== 'Add Setting') {
+          return;
+        }
+        try {
+          await addSettingToUserSettingsJson(settingsPath, 'remote.SSH.useLocalServer', true);
+        } catch (error) {
+          void vscode.window.showWarningMessage(
+            `Failed to update ${settingsPath} with remote.SSH.useLocalServer: ${formatError(error)}`
+          );
+        }
         return;
       }
     } catch (error) {
@@ -2337,36 +2625,34 @@ async function ensureLocalServerSetting(): Promise<void> {
       return;
     }
 
-    const action = await vscode.window.showInformationMessage(
-      `Slurm Connect detected ${platform} (${osVersion}). To work around a Remote-SSH issue, it can add "remote.SSH.useLocalServer": true to ${settingsPath}.`,
-      'Add Setting',
-      'Not Now'
+    const enable = await vscode.window.showWarningMessage(
+      'Remote.SSH: Use Local Server is disabled. This is required for Slurm Connect.',
+      'Enable',
+      'Ignore'
     );
-    if (action !== 'Add Setting') {
+    if (enable !== 'Enable') {
       return;
     }
-
     try {
-      await addSettingToUserSettingsJson(settingsPath, 'remote.SSH.useLocalServer', true);
+      await remoteCfg.update('useLocalServer', true, vscode.ConfigurationTarget.Global);
     } catch (error) {
       void vscode.window.showWarningMessage(
-        `Failed to update ${settingsPath} with remote.SSH.useLocalServer: ${formatError(error)}`
+        `Failed to update user settings with remote.SSH.useLocalServer: ${formatError(error)}`
       );
     }
     return;
   }
 
-  const inspection = remoteCfg.inspect<boolean>('useLocalServer');
-  if (!inspection || inspection.globalValue !== undefined) {
+  if (useLocalServer) {
     return;
   }
 
-  const action = await vscode.window.showInformationMessage(
-    `Slurm Connect detected ${platform} (${osVersion}). To work around a Remote-SSH issue, it can add "remote.SSH.useLocalServer": true to your user settings.`,
-    'Add Setting',
-    'Not Now'
+  const enable = await vscode.window.showWarningMessage(
+    'Remote.SSH: Use Local Server is disabled. This is required for Slurm Connect.',
+    'Enable',
+    'Ignore'
   );
-  if (action !== 'Add Setting') {
+  if (enable !== 'Enable') {
     return;
   }
 
@@ -2386,7 +2672,7 @@ async function ensureRemoteSshSettings(): Promise<void> {
   const enableRemoteCommand = remoteCfg.get<boolean>('enableRemoteCommand', false);
   if (!enableRemoteCommand) {
     const enable = await vscode.window.showWarningMessage(
-      'Remote.SSH: Enable Remote Command is disabled. This is required for Slurm proxying.',
+      'Remote.SSH: Enable Remote Command is disabled. This is required for Slurm Connect.',
       'Enable',
       'Ignore'
     );
@@ -2436,10 +2722,7 @@ async function connectToHost(
   const log = getOutputChannel();
   await remoteExtension.activate();
   const availableCommands = await vscode.commands.getCommands(true);
-  const sshCommands = availableCommands.filter((command) =>
-    /ssh|openssh/i.test(command)
-  );
-  log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
+  const sshCommands = availableCommands.filter((command) => /ssh|openssh/i.test(command));
 
   const trimmedPath = remoteWorkspacePath?.trim();
   if (trimmedPath) {
@@ -2478,6 +2761,7 @@ async function connectToHost(
         // try next command
       }
     }
+    log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
     return false;
   }
 
@@ -2501,6 +2785,7 @@ async function connectToHost(
         // try next command
       }
     }
+    log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
     return false;
   } finally {
     // No-op
@@ -2516,7 +2801,6 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
   await remoteExtension.activate();
   const availableCommands = await vscode.commands.getCommands(true);
   const sshCommands = availableCommands.filter((command) => /ssh|openssh|remote\.close/i.test(command));
-  log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
 
   if (vscode.env.remoteName === 'ssh-remote') {
     const directCommands = [
@@ -2575,6 +2859,7 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
       log.appendLine(`Disconnect command failed: ${command} -> ${formatError(error)}`);
     }
   }
+  log.appendLine(`Available SSH commands: ${sshCommands.join(', ') || '(none)'}`);
   return false;
 }
 

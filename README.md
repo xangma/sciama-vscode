@@ -22,15 +22,28 @@ The extension will query the login host, create a temporary SSH config entry, co
 ### SSH authentication for cluster info
 Cluster info queries use non-interactive SSH (`BatchMode=yes`). If your key is encrypted, you can either use ssh-agent or enter the passphrase in a terminal when prompted.
 
+What is ssh-agent?
+- `ssh-agent` is a background service that securely stores your SSH keys in memory after you unlock them once.
+- It avoids repeated passphrase prompts and enables non-interactive SSH commands (like cluster info queries).
+- It is especially useful when the extension runs multiple SSH calls (connect + resource discovery).
+
 - If the key is **not** in your agent, the extension will prompt you to either enter a passphrase in the terminal or add it.
 - When you choose to add it, the extension opens a terminal, runs `ssh-add`, and waits for the key to appear in your agent.
-- If the SSH agent is unavailable, the extension will only offer the terminal passphrase prompt.
+- If the SSH agent is unavailable, you will be prompted to enter your passphrase in a terminal for cluster info and connect.
 
 If you prefer to do this manually:
 ```bash
 ssh-add /path/to/your/key
 ssh-add -l
 ```
+
+Windows note:
+- If you do not have an ssh-agent available, you can enable the OpenSSH Authentication Agent service (requires admin).
+- Instructions:
+```
+https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_keymanagement#user-key-generation
+```
+- Otherwise you will be prompted for your passphrase when getting cluster info or connecting.
 
 ### Modules
 The extension runs your **module load** command before starting the proxy on the login node. This is where you should add any required cluster modules (e.g. anaconda, cuda, or custom environment setup).
