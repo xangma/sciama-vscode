@@ -86,6 +86,8 @@ If you forget to set a remote folder, VS Code may reconnect and create a new Slu
 - The extension will also prompt to put `"remote.SSH.useLocalServer": true` in your vscode settings file if you're on Windows due to a bug with the Remote-SSH extension not respecting the default value from the GUI.
 - This extension installs a managed Include block (with a note) in your SSH config that points at the Slurm Connect include file and updates that file on each connection.
 - The include file path defaults to `~/.ssh/slurm-connect.conf` and can be overridden with `slurmConnect.temporarySshConfigPath`.
+- When updating your SSH config, the extension writes a timestamped backup alongside it (prefixed with `.slurm-connect.backup-`).
+- Set `slurmConnect.useSshIncludeBlock` to false to use the legacy temporary Remote.SSH configFile override instead.
 - Use `slurmConnect.openInNewWindow` to control whether the connection opens in a new window (default: false).
 - `slurmConnect.partitionInfoCommand` controls how cluster info is fetched (default: `sinfo -h -N -o "%P|%n|%c|%m|%G"`).
 - To add GPUs or other flags, use `slurmConnect.extraSallocArgs` (e.g. `["--gres=gpu:1"]`).

@@ -52,6 +52,7 @@ interface SlurmConnectConfig {
   openInNewWindow: boolean;
   remoteWorkspacePath: string;
   temporarySshConfigPath: string;
+  useSshIncludeBlock: boolean;
   restoreSshConfigAfterConnect: boolean;
   additionalSshOptions: Record<string, string>;
   sshQueryConfigPath: string;
@@ -78,6 +79,7 @@ let previousRemoteSshConfigPath: string | undefined;
 let activeTempSshConfigPath: string | undefined;
 let lastSshAuthPrompt: { identityPath: string; timestamp: number; mode: SshAuthMode } | undefined;
 let clusterInfoRequestInFlight = false;
+let warnedLegacySshConfigOverride = false;
 const SETTINGS_SECTION = 'slurmConnect';
 const LEGACY_SETTINGS_SECTION = 'sciamaSlurm';
 const PROFILE_STORE_KEY = 'slurmConnect.profiles';
@@ -277,8 +279,41 @@ async function migrateLegacySettings(): Promise<void> {
   }
 }
 
-function isModuleLoadCommand(value: string): boolean {
-  return /^module\s+load\s+.+/i.test(value) || /^ml\s+.+/i.test(value);
+function normalizeModuleSelections(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((entry) => typeof entry === 'string')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function normalizeModuleCustomCommand(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function parseLegacyModuleLoad(
+  value: string
+): { selections: string[]; customCommand: string } | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const moduleMatch = trimmed.match(/^module\s+load\s+(.+)$/i);
+  const mlMatch = trimmed.match(/^ml\s+(.+)$/i);
+  const match = moduleMatch || mlMatch;
+  if (match) {
+    const selections = match[1]
+      .split(/[\s,]+/)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    if (selections.length === 0) {
+      return undefined;
+    }
+    return { selections, customCommand: '' };
+  }
+  return { selections: [], customCommand: trimmed };
 }
 
 function sanitizeModuleCache(cache?: ClusterUiCache): { next: ClusterUiCache; changed: boolean } {
@@ -287,25 +322,50 @@ function sanitizeModuleCache(cache?: ClusterUiCache): { next: ClusterUiCache; ch
   }
   const next: ClusterUiCache = { ...cache };
   let changed = false;
-  const hasSelectionsKey = Object.prototype.hasOwnProperty.call(cache, 'moduleSelections');
-  const hasCustomKey = Object.prototype.hasOwnProperty.call(cache, 'moduleCustomCommand');
-  const hasLegacyModuleLoadOnly = !hasSelectionsKey && !hasCustomKey;
 
-  const custom = typeof next.moduleCustomCommand === 'string' ? next.moduleCustomCommand.trim() : '';
+  const selections = normalizeModuleSelections(next.moduleSelections);
+  const custom = normalizeModuleCustomCommand(next.moduleCustomCommand);
+  const moduleLoad = typeof next.moduleLoad === 'string' ? next.moduleLoad.trim() : '';
+
+  if (selections.length > 0) {
+    next.moduleSelections = selections;
+  } else if (Object.prototype.hasOwnProperty.call(next, 'moduleSelections')) {
+    delete next.moduleSelections;
+    changed = true;
+  }
+
   if (custom) {
+    next.moduleCustomCommand = custom;
+  } else if (Object.prototype.hasOwnProperty.call(next, 'moduleCustomCommand')) {
     delete next.moduleCustomCommand;
     changed = true;
   }
 
-  const selections = Array.isArray(next.moduleSelections)
-    ? next.moduleSelections.filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
-    : [];
-  if (selections.length === 0) {
-    delete next.moduleSelections;
-    changed = changed || Array.isArray(cache.moduleSelections);
-    const moduleLoad = typeof next.moduleLoad === 'string' ? next.moduleLoad.trim() : '';
-    if (moduleLoad && (hasLegacyModuleLoadOnly || !isModuleLoadCommand(moduleLoad))) {
-      delete next.moduleLoad;
+  const hasSelections = selections.length > 0;
+  const hasCustom = custom.length > 0;
+  if (!hasSelections && !hasCustom && moduleLoad) {
+    const migrated = parseLegacyModuleLoad(moduleLoad);
+    if (migrated) {
+      if (migrated.selections.length > 0) {
+        next.moduleSelections = migrated.selections;
+      }
+      if (migrated.customCommand) {
+        next.moduleCustomCommand = migrated.customCommand;
+      }
+      if (Object.prototype.hasOwnProperty.call(next, 'moduleLoad')) {
+        delete next.moduleLoad;
+      }
+      changed = true;
+    }
+  }
+
+  if (!changed) {
+    const cachedSelections = normalizeModuleSelections(cache.moduleSelections);
+    const selectionsChanged =
+      selections.length !== cachedSelections.length ||
+      selections.some((entry, index) => entry !== cachedSelections[index]);
+    const customChanged = custom !== normalizeModuleCustomCommand(cache.moduleCustomCommand);
+    if (selectionsChanged || customChanged) {
       changed = true;
     }
   }
@@ -316,25 +376,32 @@ function sanitizeModuleCache(cache?: ClusterUiCache): { next: ClusterUiCache; ch
 function sanitizeProfileModuleCommands(values: UiValues): { next: UiValues; changed: boolean } {
   let changed = false;
   const next = { ...values };
-  const hasSelectionsKey = Object.prototype.hasOwnProperty.call(values, 'moduleSelections');
-  const hasCustomKey = Object.prototype.hasOwnProperty.call(values, 'moduleCustomCommand');
-  const hasLegacyModuleLoadOnly = !hasSelectionsKey && !hasCustomKey;
-  const custom = typeof next.moduleCustomCommand === 'string' ? next.moduleCustomCommand.trim() : '';
-  if (custom) {
-    next.moduleCustomCommand = '';
-    changed = true;
-  }
-  const selections = Array.isArray(next.moduleSelections)
-    ? next.moduleSelections.filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
-    : [];
-  if (selections.length === 0) {
-    next.moduleSelections = [];
-    const moduleLoad = typeof next.moduleLoad === 'string' ? next.moduleLoad.trim() : '';
-    if (moduleLoad && (hasLegacyModuleLoadOnly || !isModuleLoadCommand(moduleLoad))) {
+  const selections = normalizeModuleSelections(next.moduleSelections);
+  const custom = normalizeModuleCustomCommand(next.moduleCustomCommand);
+  const moduleLoad = typeof next.moduleLoad === 'string' ? next.moduleLoad.trim() : '';
+  const originalSelections = normalizeModuleSelections(values.moduleSelections);
+  const selectionsChanged =
+    selections.length !== originalSelections.length ||
+    selections.some((entry, index) => entry !== originalSelections[index]);
+  const customChanged = custom !== normalizeModuleCustomCommand(values.moduleCustomCommand);
+
+  next.moduleSelections = selections;
+  next.moduleCustomCommand = custom;
+
+  if (selections.length === 0 && !custom && moduleLoad) {
+    const migrated = parseLegacyModuleLoad(moduleLoad);
+    if (migrated) {
+      next.moduleSelections = migrated.selections;
+      next.moduleCustomCommand = migrated.customCommand;
       next.moduleLoad = '';
       changed = true;
     }
   }
+
+  if (selectionsChanged || customChanged || next.moduleLoad !== values.moduleLoad) {
+    changed = true;
+  }
+
   return { next, changed };
 }
 
@@ -627,6 +694,7 @@ interface UiValues {
   forwardAgent: boolean;
   requestTTY: boolean;
   temporarySshConfigPath: string;
+  useSshIncludeBlock: boolean;
   restoreSshConfigAfterConnect: boolean;
   sshQueryConfigPath: string;
   openInNewWindow: boolean;
@@ -914,6 +982,7 @@ function getConfigFromSettings(): SlurmConnectConfig {
     openInNewWindow: cfg.get<boolean>('openInNewWindow', false),
     remoteWorkspacePath: (cfg.get<string>('remoteWorkspacePath') || '').trim(),
     temporarySshConfigPath: (cfg.get<string>('temporarySshConfigPath') || '').trim(),
+    useSshIncludeBlock: cfg.get<boolean>('useSshIncludeBlock', true),
     restoreSshConfigAfterConnect: cfg.get<boolean>('restoreSshConfigAfterConnect', true),
     additionalSshOptions: cfg.get<Record<string, string>>('additionalSshOptions', {}),
     sshQueryConfigPath: (cfg.get<string>('sshQueryConfigPath') || '').trim(),
@@ -1189,6 +1258,26 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
+async function maybeWarnLegacySshConfigOverride(cfg: SlurmConnectConfig): Promise<boolean> {
+  if (cfg.useSshIncludeBlock) {
+    return true;
+  }
+  if (warnedLegacySshConfigOverride) {
+    return true;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    'Slurm Connect will temporarily set Remote.SSH: Config File on connect because SSH include blocks are disabled.',
+    { modal: true },
+    'Continue',
+    'Cancel'
+  );
+  if (choice !== 'Continue') {
+    return false;
+  }
+  warnedLegacySshConfigOverride = true;
+  return true;
+}
+
 
 async function connectCommand(
   overrides?: Partial<SlurmConnectConfig>,
@@ -1371,20 +1460,37 @@ async function connectCommand(
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const currentRemoteConfig = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
   const baseConfigPath = normalizeSshPath(currentRemoteConfig || defaultSshConfigPath());
-
-  try {
-    const includePath = resolveSlurmConnectIncludePath(cfg);
-    if (normalizeSshPath(includePath) === normalizeSshPath(baseConfigPath)) {
-      throw new Error('Slurm Connect include file path must not be the same as the SSH config path.');
+  if (!currentRemoteConfig) {
+    try {
+      await fs.access(baseConfigPath);
+    } catch {
+      log.appendLine(`SSH config not found at ${baseConfigPath}; creating.`);
     }
-    await writeSlurmConnectIncludeFile(hostEntry, includePath);
-    const status = await ensureSshIncludeInstalled(baseConfigPath, includePath);
-    log.appendLine(`SSH config include ${status} in ${baseConfigPath}.`);
-  } catch (error) {
-    usedLegacyConfig = true;
-    log.appendLine(`Failed to install SSH Include: ${formatError(error)}`);
-    log.appendLine('Falling back to temporary Remote.SSH configFile override.');
+  }
 
+  if (cfg.useSshIncludeBlock) {
+    try {
+      const includePath = resolveSlurmConnectIncludePath(cfg);
+      if (normalizeSshPath(includePath) === normalizeSshPath(baseConfigPath)) {
+        throw new Error('Slurm Connect include file path must not be the same as the SSH config path.');
+      }
+      await writeSlurmConnectIncludeFile(hostEntry, includePath);
+      const status = await ensureSshIncludeInstalled(baseConfigPath, includePath);
+      log.appendLine(`SSH config include ${status} in ${baseConfigPath}.`);
+    } catch (error) {
+      usedLegacyConfig = true;
+      log.appendLine(`Failed to install SSH Include: ${formatError(error)}`);
+      log.appendLine('Falling back to temporary Remote.SSH configFile override.');
+    }
+  } else {
+    const proceed = await maybeWarnLegacySshConfigOverride(cfg);
+    if (!proceed) {
+      return false;
+    }
+    usedLegacyConfig = true;
+  }
+
+  if (usedLegacyConfig) {
     const fallbackRemoteConfig = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
     const baseRemoteConfig = resolveBaseRemoteConfig(fallbackRemoteConfig);
     const includePaths = resolveSshConfigIncludes(baseRemoteConfig);
@@ -3153,6 +3259,30 @@ function ensureTrailingNewline(value: string, lineEnding: string): string {
   return value.endsWith(lineEnding) ? value : `${value}${lineEnding}`;
 }
 
+async function createSshConfigBackupPath(baseConfigPath: string): Promise<string> {
+  const dir = path.dirname(baseConfigPath);
+  const baseName = path.basename(baseConfigPath);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  let candidate = path.join(dir, `${baseName}.slurm-connect.backup-${timestamp}`);
+  let counter = 1;
+  while (true) {
+    try {
+      await fs.access(candidate);
+      candidate = path.join(dir, `${baseName}.slurm-connect.backup-${timestamp}-${counter}`);
+      counter += 1;
+    } catch {
+      break;
+    }
+  }
+  return candidate;
+}
+
+async function backupSshConfigFile(baseConfigPath: string, content: string): Promise<void> {
+  const backupPath = await createSshConfigBackupPath(baseConfigPath);
+  await fs.writeFile(backupPath, content, 'utf8');
+  getOutputChannel().appendLine(`Backed up SSH config to ${backupPath}.`);
+}
+
 async function ensureSshIncludeInstalled(baseConfigPath: string, includePath: string): Promise<'added' | 'updated' | 'already'> {
   const resolvedBase = normalizeSshPath(baseConfigPath);
   const resolvedInclude = normalizeSshPath(includePath);
@@ -3160,12 +3290,14 @@ async function ensureSshIncludeInstalled(baseConfigPath: string, includePath: st
     throw new Error('Slurm Connect include path must not be the same as the SSH config path.');
   }
   let content = '';
+  let fileExists = true;
   try {
     content = await fs.readFile(resolvedBase, 'utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw error;
     }
+    fileExists = false;
   }
   const lineEnding = detectLineEnding(content);
   const block = buildSlurmConnectIncludeBlock(includePath).split('\n').join(lineEnding);
@@ -3194,6 +3326,9 @@ async function ensureSshIncludeInstalled(baseConfigPath: string, includePath: st
   }
   if (next !== content) {
     await fs.mkdir(path.dirname(resolvedBase), { recursive: true });
+    if (fileExists) {
+      await backupSshConfigFile(resolvedBase, content);
+    }
     await fs.writeFile(resolvedBase, ensureTrailingNewline(next, lineEnding), 'utf8');
   }
   return status;
@@ -3774,6 +3909,7 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     openInNewWindow: cfg.openInNewWindow,
     remoteWorkspacePath: cfg.remoteWorkspacePath || '',
     temporarySshConfigPath: cfg.temporarySshConfigPath || '',
+    useSshIncludeBlock: cfg.useSshIncludeBlock,
     restoreSshConfigAfterConnect: cfg.restoreSshConfigAfterConnect,
     sshQueryConfigPath: cfg.sshQueryConfigPath || ''
   };
@@ -3790,6 +3926,7 @@ async function updateConfigFromUi(values: UiValues, target: vscode.Configuration
     ['openInNewWindow', Boolean(values.openInNewWindow)],
     ['remoteWorkspacePath', values.remoteWorkspacePath.trim()],
     ['temporarySshConfigPath', values.temporarySshConfigPath.trim()],
+    ['useSshIncludeBlock', Boolean(values.useSshIncludeBlock)],
     ['restoreSshConfigAfterConnect', Boolean(values.restoreSshConfigAfterConnect)],
     ['sshQueryConfigPath', values.sshQueryConfigPath.trim()]
   ];
@@ -3814,7 +3951,17 @@ function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConne
   if (has('accountCommand')) overrides.accountCommand = String(values.accountCommand ?? '').trim();
   if (has('user')) overrides.user = String(values.user ?? '').trim();
   if (has('identityFile')) overrides.identityFile = String(values.identityFile ?? '').trim();
-  if (has('moduleLoad')) overrides.moduleLoad = String(values.moduleLoad ?? '').trim();
+  if (has('moduleLoad')) {
+    overrides.moduleLoad = String(values.moduleLoad ?? '').trim();
+  } else {
+    const selections = normalizeModuleSelections(values.moduleSelections);
+    const custom = normalizeModuleCustomCommand(values.moduleCustomCommand);
+    if (custom) {
+      overrides.moduleLoad = custom;
+    } else if (selections.length > 0) {
+      overrides.moduleLoad = `module load ${selections.join(' ')}`;
+    }
+  }
   if (has('proxyCommand')) overrides.proxyCommand = String(values.proxyCommand ?? '').trim();
   if (has('proxyArgs')) overrides.proxyArgs = parseListInput(String(values.proxyArgs ?? ''));
   if (has('extraSallocArgs')) overrides.extraSallocArgs = parseListInput(String(values.extraSallocArgs ?? ''));
@@ -3924,6 +4071,11 @@ function parseNonNegativeNumberInput(input: string): number {
 }
 
 function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
+  const moduleLoad = values.moduleLoad.trim();
+  const moduleCustom = normalizeModuleCustomCommand(values.moduleCustomCommand);
+  const moduleSelections = normalizeModuleSelections(values.moduleSelections);
+  const resolvedModuleLoad =
+    moduleLoad || moduleCustom || (moduleSelections.length > 0 ? `module load ${moduleSelections.join(' ')}` : '');
   return {
     loginHosts: parseListInput(values.loginHosts),
     loginHostsCommand: values.loginHostsCommand.trim(),
@@ -3934,7 +4086,7 @@ function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
     accountCommand: values.accountCommand.trim(),
     user: values.user.trim(),
     identityFile: values.identityFile.trim(),
-    moduleLoad: values.moduleLoad.trim(),
+    moduleLoad: resolvedModuleLoad,
     proxyCommand: values.proxyCommand.trim(),
     proxyArgs: parseListInput(values.proxyArgs),
     extraSallocArgs: parseListInput(values.extraSallocArgs),
@@ -3953,6 +4105,7 @@ function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
     openInNewWindow: Boolean(values.openInNewWindow),
     remoteWorkspacePath: values.remoteWorkspacePath.trim(),
     temporarySshConfigPath: values.temporarySshConfigPath.trim(),
+    useSshIncludeBlock: Boolean(values.useSshIncludeBlock),
     restoreSshConfigAfterConnect: Boolean(values.restoreSshConfigAfterConnect),
     sshQueryConfigPath: values.sshQueryConfigPath.trim()
   };
@@ -3986,9 +4139,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
     label { font-size: 12px; display: block; margin-bottom: 4px; color: var(--vscode-foreground); }
     input, textarea, select, button { width: 100%; box-sizing: border-box; font-size: 12px; padding: 6px; }
     input:not([type="checkbox"]), textarea, select {
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
-      border: 1px solid var(--vscode-input-border);
+      background: var(--vscode-input-background, var(--vscode-editorWidget-background));
+      color: var(--vscode-input-foreground, var(--vscode-foreground));
+      border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
+      box-shadow: 0 0 0 1px var(--vscode-input-border, var(--vscode-widget-border)) inset;
     }
     input:not([type="checkbox"]):focus, textarea:focus, select:focus {
       outline: 1px solid var(--vscode-focusBorder);
@@ -4006,7 +4160,36 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .row { display: flex; gap: 8px; }
     .row > div { flex: 1; }
     .checkbox { display: flex; align-items: center; gap: 6px; }
-    .checkbox input { width: auto; }
+    input[type="checkbox"] {
+      appearance: none;
+      -webkit-appearance: none;
+      width: 14px;
+      height: 14px;
+      padding: 0;
+      margin: 0;
+      border-radius: 3px;
+      border: 1px solid var(--vscode-checkbox-border, var(--vscode-input-border, #888));
+      background: var(--vscode-checkbox-background, var(--vscode-input-background, #fff));
+      display: inline-grid;
+      place-content: center;
+      cursor: pointer;
+    }
+    input[type="checkbox"]:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 1px;
+    }
+    input[type="checkbox"]:checked {
+      background: var(--vscode-checkbox-background, var(--vscode-button-background, #0e639c));
+      border-color: var(--vscode-checkbox-border, var(--vscode-button-background, #0e639c));
+    }
+    input[type="checkbox"]:checked::after {
+      content: '';
+      width: 4px;
+      height: 8px;
+      border: solid var(--vscode-checkbox-foreground, var(--vscode-button-foreground, #fff));
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
     .buttons { display: flex; gap: 8px; }
     .buttons button { flex: 1; }
     .hidden { display: none; }
@@ -4212,6 +4395,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <label for="temporarySshConfigPath">Slurm Connect include file path</label>
     <input id="temporarySshConfigPath" type="text" />
     <div class="checkbox">
+      <input id="useSshIncludeBlock" type="checkbox" />
+      <label for="useSshIncludeBlock">Install SSH Include block (recommended)</label>
+    </div>
+    <div id="sshIncludeSettingHint" class="hint"></div>
+    <div class="checkbox">
       <input id="restoreSshConfigAfterConnect" type="checkbox" />
       <label for="restoreSshConfigAfterConnect">Restore Remote.SSH config after legacy fallback</label>
     </div>
@@ -4245,7 +4433,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <button id="connectToggle">Connect</button>
     </div>
     <div id="connectStatus" class="hint"></div>
-  <div class="hint">Connections add a small Slurm Connect Include block to your SSH config and update the Slurm Connect include file.</div>
+  <div id="sshIncludeStatus" class="hint"></div>
   </div>
 
   <script nonce="${nonce}">
@@ -4317,6 +4505,17 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (!el) return;
       el.textContent = text || '';
       el.style.color = isError ? '#b00020' : '#555';
+    }
+
+    function updateSshIncludeHints() {
+      const useInclude = Boolean(getValue('useSshIncludeBlock'));
+      const text = useInclude
+        ? 'Connections add a small Slurm Connect Include block to your SSH config and update the Slurm Connect include file.'
+        : 'Include block disabled; Slurm Connect will temporarily override Remote.SSH: Config File on connect.';
+      const settingHint = document.getElementById('sshIncludeSettingHint');
+      if (settingHint) settingHint.textContent = text;
+      const statusHint = document.getElementById('sshIncludeStatus');
+      if (statusHint) statusHint.textContent = text;
     }
 
     function setConnectState(state) {
@@ -5085,6 +5284,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         defaultGpuCount: getValue('defaultGpuCount'),
         sshHostPrefix: getValue('sshHostPrefix'),
         temporarySshConfigPath: getValue('temporarySshConfigPath'),
+        useSshIncludeBlock: getValue('useSshIncludeBlock'),
         restoreSshConfigAfterConnect: getValue('restoreSshConfigAfterConnect'),
         sshQueryConfigPath: getValue('sshQueryConfigPath'),
         forwardAgent: getValue('forwardAgent'),
@@ -5121,6 +5321,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           saveTarget.value = message.saveTarget;
         }
         applyModuleState(values);
+        updateSshIncludeHints();
         if (message.clusterInfo) {
           applyClusterInfo(message.clusterInfo);
           if (message.clusterInfoCachedAt) {
@@ -5312,6 +5513,13 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     addFieldListener('defaultPartition', updatePartitionDetails);
     addFieldListener('defaultGpuType', updatePartitionDetails);
+
+    const includeToggle = document.getElementById('useSshIncludeBlock');
+    if (includeToggle) {
+      includeToggle.addEventListener('change', () => {
+        updateSshIncludeHints();
+      });
+    }
 
     document.getElementById('profileSelect').addEventListener('change', () => {
       // no-op, selection already reflects current profile
