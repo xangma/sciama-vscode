@@ -1,6 +1,6 @@
 # Slurm Connect (VS Code extension)
 
-This extension helps users allocate Slurm resources on a cluster and connect VS Code Remote-SSH through a compute node. It discovers partitions (and optionally QoS/accounts), builds the `RemoteCommand` for a proxy script, creates a temporary SSH host entry, and optionally connects right away.
+This extension helps users allocate Slurm resources on a cluster and connect VS Code Remote-SSH through a compute node. It discovers partitions (and optionally QoS/accounts), builds the `RemoteCommand` for a proxy script, writes a Slurm Connect SSH include file, installs a small Include block (with a note) in your SSH config, and optionally connects right away.
 
 ## Requirements
 - VS Code with **Remote - SSH** installed.
@@ -15,7 +15,7 @@ This extension helps users allocate Slurm resources on a cluster and connect VS 
 3. Enter login host, username, and identity file.
 4. Click **Get cluster info**, choose resources, then **Connect**.
 
-The extension will query the login host, create a temporary SSH config entry, connect, and then restore your previous Remote-SSH config setting. Your main SSH config is not modified.
+The extension will query the login host, write a Slurm Connect SSH include file, ensure your SSH config contains a small Slurm Connect Include block (with a note), and connect. It does not replace your SSH config; it only adds the managed block.
 
 ## Usage details
 
@@ -84,7 +84,8 @@ If you forget to set a remote folder, VS Code may reconnect and create a new Slu
 - Ensure **Remote.SSH: Enable Remote Command** is enabled (the extension will prompt to enable it).
 - **Remote.SSH: Lockfiles In Tmp** is recommended on shared filesystems (the extension will prompt to enable it).
 - The extension will also prompt to put `"remote.SSH.useLocalServer": true` in your vscode settings file if you're on Windows due to a bug with the Remote-SSH extension not respecting the default value from the GUI.
-- This extension uses a temporary SSH config for each connection and does not modify your main SSH config.
+- This extension installs a managed Include block (with a note) in your SSH config that points at the Slurm Connect include file and updates that file on each connection.
+- The include file path defaults to `~/.ssh/slurm-connect.conf` and can be overridden with `slurmConnect.temporarySshConfigPath`.
 - Use `slurmConnect.openInNewWindow` to control whether the connection opens in a new window (default: false).
 - `slurmConnect.partitionInfoCommand` controls how cluster info is fetched (default: `sinfo -h -N -o "%P|%n|%c|%m|%G"`).
 - To add GPUs or other flags, use `slurmConnect.extraSallocArgs` (e.g. `["--gres=gpu:1"]`).

@@ -1,7 +1,12 @@
 import * as assert from 'assert';
+import * as os from 'os';
+import * as path from 'path';
 import {
   buildHostEntry,
+  buildSlurmConnectIncludeBlock,
+  buildSlurmConnectIncludeContent,
   buildTemporarySshConfigContent,
+  expandHome,
   formatSshConfigValue
 } from '../utils/sshConfig';
 import { parsePartitionInfoOutput } from '../utils/clusterInfo';
@@ -41,6 +46,21 @@ function testBuildTemporarySshConfigContentIncludes(): void {
   assert.ok(content.includes('Include "/Users/Test User/.ssh/config"'));
 }
 
+function testBuildSlurmConnectIncludeHelpers(): void {
+  const block = buildSlurmConnectIncludeBlock('/Users/Test User/.ssh/slurm-connect.conf');
+  assert.ok(block.includes('Slurm Connect'));
+  assert.ok(block.includes('Include "/Users/Test User/.ssh/slurm-connect.conf"'));
+
+  const content = buildSlurmConnectIncludeContent('Host alias\n  HostName login');
+  assert.ok(content.startsWith('# Slurm Connect SSH hosts'));
+}
+
+function testExpandHome(): void {
+  const home = os.homedir();
+  assert.strictEqual(expandHome('~'), home);
+  assert.strictEqual(expandHome('~/config'), path.join(home, 'config'));
+}
+
 function testParsePartitionInfoOutputNodeNames(): void {
   const output = 'gpu*|2gpu-01|64|128000|gpu:a100:4';
   const info = parsePartitionInfoOutput(output);
@@ -55,6 +75,8 @@ function run(): void {
   testFormatSshConfigValue();
   testBuildHostEntryQuotes();
   testBuildTemporarySshConfigContentIncludes();
+  testBuildSlurmConnectIncludeHelpers();
+  testExpandHome();
   testParsePartitionInfoOutputNodeNames();
   console.log('extension tests passed');
 }

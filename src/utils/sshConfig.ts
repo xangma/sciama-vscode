@@ -9,12 +9,22 @@ export interface HostEntryConfig {
   additionalSshOptions?: Record<string, string>;
 }
 
+export const SLURM_CONNECT_INCLUDE_START = '# >>> Slurm Connect (VS Code extension)';
+export const SLURM_CONNECT_INCLUDE_END = '# <<< Slurm Connect';
+
 export function expandHome(input: string): string {
   if (!input) {
     return input;
   }
   if (input.startsWith('~')) {
-    return path.join(os.homedir(), input.slice(1));
+    const remainder = input.slice(1);
+    if (!remainder) {
+      return os.homedir();
+    }
+    if (remainder.startsWith('/') || remainder.startsWith('\\')) {
+      return path.join(os.homedir(), remainder.slice(1));
+    }
+    return path.join(os.homedir(), remainder);
   }
   return input;
 }
@@ -85,5 +95,22 @@ export function buildTemporarySshConfigContent(entry: string, includePaths: stri
   if (includeLines.length > 0) {
     contentLines.push('', ...includeLines);
   }
+  return `${contentLines.join('\n')}\n`;
+}
+
+export function buildSlurmConnectIncludeBlock(includePath: string): string {
+  const includeLine = `Include ${formatSshConfigValue(includePath)}`;
+  const lines = [
+    SLURM_CONNECT_INCLUDE_START,
+    '# This Include is managed by the Slurm Connect extension.',
+    '# Remove this block to stop injecting Slurm Connect hosts.',
+    includeLine,
+    SLURM_CONNECT_INCLUDE_END
+  ];
+  return lines.join('\n');
+}
+
+export function buildSlurmConnectIncludeContent(entry: string): string {
+  const contentLines = ['# Slurm Connect SSH hosts', entry.trimEnd()];
   return `${contentLines.join('\n')}\n`;
 }
