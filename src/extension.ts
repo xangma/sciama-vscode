@@ -155,6 +155,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   extensionWorkspaceState = context.workspaceState;
   await migrateLegacyState();
   await migrateLegacySettings();
+  await migrateLegacyModuleCommands();
   await migrateClusterSettingsToCache();
   syncConnectionStateFromEnvironment();
   const disposable = vscode.commands.registerCommand('slurmConnect.connect', () => {
@@ -272,6 +273,104 @@ async function migrateLegacySettings(): Promise<void> {
           // Ignore cleanup failures.
         }
       }
+    }
+  }
+}
+
+function isModuleLoadCommand(value: string): boolean {
+  return /^module\s+load\s+.+/i.test(value) || /^ml\s+.+/i.test(value);
+}
+
+function sanitizeModuleCache(cache?: ClusterUiCache): { next: ClusterUiCache; changed: boolean } {
+  if (!cache) {
+    return { next: {}, changed: false };
+  }
+  const next: ClusterUiCache = { ...cache };
+  let changed = false;
+  const hasSelectionsKey = Object.prototype.hasOwnProperty.call(cache, 'moduleSelections');
+  const hasCustomKey = Object.prototype.hasOwnProperty.call(cache, 'moduleCustomCommand');
+  const hasLegacyModuleLoadOnly = !hasSelectionsKey && !hasCustomKey;
+
+  const custom = typeof next.moduleCustomCommand === 'string' ? next.moduleCustomCommand.trim() : '';
+  if (custom) {
+    delete next.moduleCustomCommand;
+    changed = true;
+  }
+
+  const selections = Array.isArray(next.moduleSelections)
+    ? next.moduleSelections.filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
+    : [];
+  if (selections.length === 0) {
+    delete next.moduleSelections;
+    changed = changed || Array.isArray(cache.moduleSelections);
+    const moduleLoad = typeof next.moduleLoad === 'string' ? next.moduleLoad.trim() : '';
+    if (moduleLoad && (hasLegacyModuleLoadOnly || !isModuleLoadCommand(moduleLoad))) {
+      delete next.moduleLoad;
+      changed = true;
+    }
+  }
+
+  return { next, changed };
+}
+
+function sanitizeProfileModuleCommands(values: UiValues): { next: UiValues; changed: boolean } {
+  let changed = false;
+  const next = { ...values };
+  const hasSelectionsKey = Object.prototype.hasOwnProperty.call(values, 'moduleSelections');
+  const hasCustomKey = Object.prototype.hasOwnProperty.call(values, 'moduleCustomCommand');
+  const hasLegacyModuleLoadOnly = !hasSelectionsKey && !hasCustomKey;
+  const custom = typeof next.moduleCustomCommand === 'string' ? next.moduleCustomCommand.trim() : '';
+  if (custom) {
+    next.moduleCustomCommand = '';
+    changed = true;
+  }
+  const selections = Array.isArray(next.moduleSelections)
+    ? next.moduleSelections.filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
+    : [];
+  if (selections.length === 0) {
+    next.moduleSelections = [];
+    const moduleLoad = typeof next.moduleLoad === 'string' ? next.moduleLoad.trim() : '';
+    if (moduleLoad && (hasLegacyModuleLoadOnly || !isModuleLoadCommand(moduleLoad))) {
+      next.moduleLoad = '';
+      changed = true;
+    }
+  }
+  return { next, changed };
+}
+
+async function migrateLegacyModuleCommands(): Promise<void> {
+  if (extensionGlobalState) {
+    const current = getClusterUiCache(extensionGlobalState);
+    const { next, changed } = sanitizeModuleCache(current);
+    if (changed) {
+      await extensionGlobalState.update(CLUSTER_UI_CACHE_KEY, next);
+    }
+  }
+
+  if (extensionWorkspaceState) {
+    const current = getClusterUiCache(extensionWorkspaceState);
+    const { next, changed } = sanitizeModuleCache(current);
+    if (changed) {
+      await extensionWorkspaceState.update(CLUSTER_UI_CACHE_KEY, next);
+    }
+  }
+
+  if (extensionGlobalState) {
+    const store = getProfileStore();
+    let changed = false;
+    for (const [key, profile] of Object.entries(store)) {
+      const sanitized = sanitizeProfileModuleCommands(profile.values);
+      if (sanitized.changed) {
+        store[key] = {
+          ...profile,
+          values: sanitized.next,
+          updatedAt: new Date().toISOString()
+        };
+        changed = true;
+      }
+    }
+    if (changed) {
+      await extensionGlobalState.update(PROFILE_STORE_KEY, store);
     }
   }
 }
