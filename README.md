@@ -25,6 +25,20 @@ The **Get cluster info** button queries your login host to discover available Sl
 the dropdowns and suggestions in the UI so you can pick valid values quickly. You can still type values manually,
 and the fetched data is cached per login host to speed up the next load.
 
+#### Free-resource filtering (default on)
+When enabled, the UI filters suggestions to **currently free** resources. This is computed from the same SSH
+cluster-info call (no extra prompts) by combining:
+- `sinfo -h -N -o "%n|%c|%t|%P|%G"` for per-node totals + state
+- `squeue -h -o "%t|%C|%b|%N"` for running job usage
+
+Bad nodes (down/drain/maint) are treated as unavailable, and pending jobs are ignored. The filter limits:
+- **Partition list** to partitions with any free CPU/GPU capacity.
+- **Nodes** to the count of nodes with free CPU.
+- **CPUs per task** to the largest free CPU block on a single node.
+- **GPU type/count** to free GPU/MIG slices currently available.
+
+Toggle in the UI or via `slurmConnect.filterFreeResources`.
+
 ### Profiles
 Profiles let you save and switch between sets of Slurm Connect inputs (login host, identity file, partitions,
 resource defaults, module selections, etc.). Use **Save profile** to store the current form values, **Load** to

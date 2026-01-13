@@ -74,6 +74,11 @@
           "default": "sinfo -h -N -o \"%P|%n|%c|%m|%G\"",
           "description": "Remote command that outputs partition info in the format name|node|cpus|memMB|gres."
         },
+        "slurmConnect.filterFreeResources": {
+          "type": "boolean",
+          "default": true,
+          "description": "Filter cluster info suggestions to currently free resources."
+        },
         "slurmConnect.qosCommand": {
           "type": "string",
           "default": "",

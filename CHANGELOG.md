@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file based on git tag
 ## Unreleased
 - No unreleased changes.
 
+## 0.3.3 - 2026-01-13
+### Added
+- Free-resource filtering for cluster info suggestions (default on) with a UI toggle and setting.
+- Free-resource parsing from `sinfo` + `squeue` embedded in the existing single SSH cluster-info call.
+
+### Docs
+- Documented how free-resource filtering is computed and how it affects UI suggestions.
+
 ## 0.3.2 - 2026-01-12
 ### Added
 - SSH config backup support and a new setting for a managed Include block.
