@@ -6,7 +6,7 @@ This extension helps users allocate Slurm resources on a cluster and connect VS 
 - VS Code with **Remote - SSH** installed.
 - SSH keys configured for the cluster (agent forwarding recommended).
 - Python 3.9+ available on the login nodes.
-- `vscode-shell-proxy.py` available on the login nodes (via module load or PATH).
+- [`vscode-shell-proxy.py`](https://github.com/xangma/vscode-shell-proxy/blob/main/vscode-shell-proxy.py) available somewhere on the login nodes.
 - ssh-agent running with your key added (recommended for encrypted keys).
 
 ## Quick start (users)
