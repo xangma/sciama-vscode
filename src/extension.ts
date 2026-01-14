@@ -1641,11 +1641,7 @@ async function queryAvailableModules(loginHost: string, cfg: SlurmConnectConfig)
     try {
       log.appendLine(`Module list command: ${command}`);
       const output = await runSshCommand(loginHost, cfg, command);
-      const lowered = output.toLowerCase();
-      if (lowered.includes('command not found') || lowered.includes('module: not found')) {
-        continue;
-      }
-      const modules = parseSimpleList(output);
+      const modules = parseModulesOutput(output);
       if (modules.length > 0) {
         return modules;
       }
@@ -1983,15 +1979,107 @@ function parseCombinedClusterInfoOutput(
   };
 }
 
+function sanitizeModuleOutput(output: string): string {
+  const withoutOsc = output.replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g, '');
+  const withoutAnsi = withoutOsc.replace(
+    /[\u001B\u009B][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><]/g,
+    ''
+  );
+  return withoutAnsi.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u0080-\u009F]/g, '');
+}
+
 function parseModulesOutput(output: string): string[] {
   if (!output) {
     return [];
   }
-  const lowered = output.toLowerCase();
+  const sanitized = sanitizeModuleOutput(output);
+  const lowered = sanitized.toLowerCase();
   if (lowered.includes('command not found') || lowered.includes('module: not found')) {
     return [];
   }
-  return parseSimpleList(output);
+  const lines = sanitized.split(/\r?\n/);
+  const entries: string[] = [];
+  const isSeparatorToken = (token: string): boolean => /^-+$/.test(token);
+  const isLegendLine = (line: string): boolean => {
+    const lower = line.toLowerCase();
+    if (lower.startsWith('where:')) {
+      return true;
+    }
+    if (lower.includes('module is loaded') || lower.includes('module is auto-loaded')) {
+      return true;
+    }
+    if (lower.includes('module is inactive') || lower.includes('module is hidden')) {
+      return true;
+    }
+    if (lower.includes('module spider') || lower.includes('module help')) {
+      return true;
+    }
+    if (lower.startsWith('to get ') || lower.startsWith('to find ') || lower.startsWith('to list ')) {
+      return true;
+    }
+    if (lower.startsWith('use "module') || lower.startsWith('use module')) {
+      return true;
+    }
+    return false;
+  };
+  const stripTrailingTag = (value: string): string => {
+    let trimmed = value.trim();
+    const tagPattern = /\s*[<(]\s*(?:default|[a-zA-Z]{1,3})\s*[>)]\s*$/;
+    while (tagPattern.test(trimmed)) {
+      trimmed = trimmed.replace(tagPattern, '').trim();
+    }
+    return trimmed;
+  };
+  const normalizeHeader = (value: string): string => {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return '';
+    }
+    return trimmed.endsWith(':') ? trimmed : `${trimmed}:`;
+  };
+  const headerFromDashLine = (line: string): string | null => {
+    const match = line.match(/^-+\s*(\/\S.*?)\s*-+$/);
+    return match ? match[1] : null;
+  };
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (isLegendLine(trimmed)) {
+      continue;
+    }
+    if (trimmed.startsWith('/') && trimmed.endsWith(':')) {
+      entries.push(trimmed);
+      continue;
+    }
+    const dashedHeader = headerFromDashLine(trimmed);
+    if (dashedHeader) {
+      const normalized = normalizeHeader(dashedHeader);
+      if (normalized) {
+        entries.push(normalized);
+      }
+      continue;
+    }
+    const tokens = /\s/.test(trimmed)
+      ? trimmed.split(/\s+/).map((value) => value.trim()).filter(Boolean)
+      : [trimmed];
+    for (const token of tokens) {
+      if (isSeparatorToken(token)) {
+        continue;
+      }
+      if (token.startsWith('/') && token.endsWith(':')) {
+        entries.push(token);
+        continue;
+      }
+      const cleaned = stripTrailingTag(token);
+      if (!cleaned) {
+        continue;
+      }
+      entries.push(cleaned);
+    }
+  }
+  return uniqueList(entries);
 }
 
 async function fetchClusterInfoSingleCall(
@@ -4642,6 +4730,19 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .dropdown-option:hover {
       background: var(--vscode-list-hoverBackground, var(--vscode-button-hoverBackground));
     }
+    .dropdown-option.module-header {
+      cursor: default;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--vscode-descriptionForeground);
+      background: transparent;
+      border-top: 1px solid var(--vscode-input-border);
+      margin-top: 4px;
+      padding-top: 6px;
+    }
+    .dropdown-option.module-header:hover {
+      background: transparent;
+    }
     .module-item {
       display: flex;
       align-items: center;
@@ -5135,6 +5236,20 @@ function getWebviewHtml(webview: vscode.Webview): string {
       });
     }
 
+    function isModuleHeaderEntry(value) {
+      const trimmed = String(value || '').trim();
+      return trimmed.startsWith('/') && trimmed.endsWith(':');
+    }
+
+    function formatModuleHeaderLabel(value) {
+      const trimmed = String(value || '').trim();
+      return trimmed.endsWith(':') ? trimmed.slice(0, -1) : trimmed;
+    }
+
+    function getSelectableModuleCount() {
+      return availableModules.filter((entry) => !isModuleHeaderEntry(entry)).length;
+    }
+
     function normalizeModuleName(value) {
       return String(value || '').replace(/\s+/g, '');
     }
@@ -5145,6 +5260,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
       const normalizedMap = new Map();
       availableModules.forEach((name) => {
+        if (isModuleHeaderEntry(name)) {
+          return;
+        }
         normalizedMap.set(normalizeModuleName(name), name);
       });
       const result = [];
@@ -5178,7 +5296,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         .split(/[\s,]+/)
         .map((value) => value.trim())
         .filter(Boolean);
-      return coalesceModuleTokens(tokens);
+      return coalesceModuleTokens(tokens).filter((entry) => !isModuleHeaderEntry(entry));
     }
 
     function updateModuleHint() {
@@ -5188,11 +5306,12 @@ function getWebviewHtml(webview: vscode.Webview): string {
         hint.textContent = 'Custom module command set; adding modules will replace it.';
         return;
       }
-      if (!availableModules.length) {
+      const moduleCount = getSelectableModuleCount();
+      if (!moduleCount) {
         hint.textContent = 'No module list available. Type module names below.';
         return;
       }
-      hint.textContent = availableModules.length + ' modules available. Click the field or type to filter.';
+      hint.textContent = moduleCount + ' modules available. Click the field or type to filter.';
     }
 
     function syncModuleLoadValue() {
@@ -5270,7 +5389,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const list = Array.isArray(modules) ? modules : [];
       availableModules = list.slice();
       const picker = document.getElementById('modulePicker');
-      if (availableModules.length === 0) {
+      if (getSelectableModuleCount() === 0) {
         hideModuleMenu();
         if (picker) picker.classList.add('no-options');
       } else if (picker) {
@@ -5284,7 +5403,44 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (!text) {
         return availableModules.slice();
       }
-      return availableModules.filter((name) => name.toLowerCase().includes(text));
+      const results = [];
+      const seen = new Set();
+      const push = (value) => {
+        if (!seen.has(value)) {
+          seen.add(value);
+          results.push(value);
+        }
+      };
+      let currentHeader = null;
+      let headerAdded = false;
+      let includeAllInSection = false;
+      availableModules.forEach((name) => {
+        if (isModuleHeaderEntry(name)) {
+          currentHeader = name;
+          headerAdded = false;
+          includeAllInSection = false;
+          const headerLabel = formatModuleHeaderLabel(name).toLowerCase();
+          const headerMatches = name.toLowerCase().includes(text) || headerLabel.includes(text);
+          if (headerMatches) {
+            includeAllInSection = true;
+            push(name);
+            headerAdded = true;
+          }
+          return;
+        }
+        if (includeAllInSection) {
+          push(name);
+          return;
+        }
+        if (name.toLowerCase().includes(text)) {
+          if (currentHeader && !headerAdded) {
+            push(currentHeader);
+            headerAdded = true;
+          }
+          push(name);
+        }
+      });
+      return results;
     }
 
     function renderModuleMenu(options) {
@@ -5300,6 +5456,14 @@ function getWebviewHtml(webview: vscode.Webview): string {
         return;
       }
       items.forEach((moduleName) => {
+        if (isModuleHeaderEntry(moduleName)) {
+          const header = document.createElement('div');
+          header.className = 'dropdown-option module-header';
+          header.textContent = formatModuleHeaderLabel(moduleName);
+          header.setAttribute('aria-disabled', 'true');
+          menu.appendChild(header);
+          return;
+        }
         const option = document.createElement('div');
         option.className = 'dropdown-option';
         option.textContent = moduleName;
@@ -5319,7 +5483,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function showModuleMenu(showAll, closeOthers = true) {
       const menu = document.getElementById('moduleMenu');
       const input = document.getElementById('moduleInput');
-      if (!menu || !input || availableModules.length === 0) return;
+      if (!menu || !input || getSelectableModuleCount() === 0) return;
       if (closeOthers) {
         closeAllMenus();
       }
@@ -5343,6 +5507,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
       let changed = false;
       entries.forEach((entry) => {
+        if (isModuleHeaderEntry(entry)) {
+          return;
+        }
         if (!selectedModules.includes(entry)) {
           selectedModules.push(entry);
           changed = true;
