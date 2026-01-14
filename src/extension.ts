@@ -4764,7 +4764,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
 <body>
   <h2>Slurm Connect</h2>
 
-  <div class="section">
+  <details class="section" id="connectionSection" open>
+    <summary>Connection settings</summary>
     <label for="loginHosts">Login host</label>
     <input id="loginHosts" type="text" placeholder="hostname1.com" />
     <label for="user">SSH user</label>
@@ -4772,6 +4773,16 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <label for="identityFile">Identity file</label>
     <input id="identityFile" type="text" />
     <div id="agentStatus" class="hint"></div>
+    <div class="checkbox">
+      <input id="openInNewWindow" type="checkbox" />
+      <label for="openInNewWindow">Open in new window</label>
+    </div>
+    <label for="remoteWorkspacePath">Remote folder to open (optional)</label>
+    <input id="remoteWorkspacePath" type="text" placeholder="/home/user/project" />
+  </details>
+
+  <details class="section" id="resourceSection" open>
+    <summary>Resource settings</summary>
     <div class="buttons" style="margin-top: 8px;">
       <button id="getClusterInfo">Get cluster info</button>
       <button id="clearClusterInfo">Clear cluster info</button>
@@ -4782,9 +4793,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     </div>
     <div id="clusterStatus" class="hint"></div>
     <div id="freeResourceWarning" class="hint warning"></div>
-  </div>
 
-  <div class="section">
     <label for="defaultPartitionInput">Partition</label>
     <div class="combo-picker" id="defaultPartitionPicker">
       <input id="defaultPartitionInput" type="text" placeholder="Cluster default if blank" />
@@ -4842,9 +4851,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <button id="fillPartitionDefaults" type="button">Use partition defaults</button>
       <button id="clearResources" type="button">Clear resources</button>
     </div>
-  </div>
 
-  <div class="section">
     <label for="moduleInput">Modules</label>
     <div class="row module-row">
       <div class="combo-picker" id="modulePicker">
@@ -4858,18 +4865,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <div id="moduleList" class="module-list"></div>
     <div id="moduleHint" class="hint"></div>
     <input id="moduleLoad" type="hidden" />
-  </div>
+  </details>
 
-  <div class="section">
-    <div class="checkbox">
-      <input id="openInNewWindow" type="checkbox" />
-      <label for="openInNewWindow">Open in new window</label>
-    </div>
-    <label for="remoteWorkspacePath">Remote folder to open (optional)</label>
-    <input id="remoteWorkspacePath" type="text" placeholder="/home/user/project" />
-  </div>
-
-  <details class="section">
+  <details class="section" id="profilesSection">
     <summary>Profiles</summary>
     <label for="profileSelect">Saved profiles</label>
     <select id="profileSelect"></select>
@@ -4881,7 +4879,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <div id="profileStatus" class="hint"></div>
   </details>
 
-  <details class="section">
+  <details class="section" id="advancedSection">
     <summary>Advanced settings</summary>
     <label for="loginHostsCommand">Login hosts command (optional)</label>
     <input id="loginHostsCommand" type="text" />
@@ -5016,6 +5014,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
       el.textContent = text || '';
     }
 
+    initSectionState();
+
     function setProfileStatus(text, isError) {
       const el = document.getElementById('profileStatus');
       if (!el) return;
@@ -5088,6 +5088,36 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
       const ageLabel = formatAgeLabel(ageMs);
       setFreeResourceWarning('Free resource data is ' + ageLabel + ' old. Click "Get cluster info" to refresh.');
+    }
+
+    function initSectionState() {
+      const sectionState = (vscode.getState && vscode.getState()) || {};
+      const defaults = {
+        connectionSection: true,
+        resourceSection: true,
+        profilesSection: false,
+        advancedSection: false
+      };
+      const sections = [
+        { id: 'connectionSection', key: 'connectionSection' },
+        { id: 'resourceSection', key: 'resourceSection' },
+        { id: 'profilesSection', key: 'profilesSection' },
+        { id: 'advancedSection', key: 'advancedSection' }
+      ];
+      sections.forEach((section) => {
+        const el = document.getElementById(section.id);
+        if (!el) return;
+        const stored =
+          typeof sectionState[section.key] === 'boolean'
+            ? sectionState[section.key]
+            : defaults[section.key];
+        el.open = stored;
+        el.addEventListener('toggle', () => {
+          const nextState = (vscode.getState && vscode.getState()) || {};
+          nextState[section.key] = el.open;
+          vscode.setState(nextState);
+        });
+      });
     }
 
     function setConnectState(state) {
