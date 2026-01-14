@@ -1816,10 +1816,12 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
 
     const info = await fetchClusterInfo(loginHost, cfg);
     cacheClusterInfo(loginHost, info);
+    const cached = getCachedClusterInfo(loginHost);
     const agentStatus = await buildAgentStatusMessage(values.identityFile);
     webview.postMessage({
       command: 'clusterInfo',
       info,
+      fetchedAt: cached?.fetchedAt,
       agentStatus: agentStatus.text,
       agentStatusError: agentStatus.isError
     });
@@ -4686,6 +4688,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .buttons button { flex: 1; }
     .hidden { display: none; }
     .hint { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
+    .warning {
+      color: var(--vscode-editorWarning-foreground, #b58900);
+    }
     details summary { cursor: pointer; margin-bottom: 6px; color: var(--vscode-foreground); }
     .module-row { align-items: center; }
     .row > .module-actions { flex: 0 0 auto; }
@@ -4776,6 +4781,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <label for="filterFreeResources">Show only free resources</label>
     </div>
     <div id="clusterStatus" class="hint"></div>
+    <div id="freeResourceWarning" class="hint warning"></div>
   </div>
 
   <div class="section">
@@ -4947,7 +4953,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
+    const FREE_RESOURCE_STALE_MS = 10 * 60 * 1000;
     let clusterInfo = null;
+    let clusterInfoFetchedAt = null;
     let lastValues = {};
     let connectionState = 'idle';
     let availableModules = [];
@@ -5002,6 +5010,12 @@ function getWebviewHtml(webview: vscode.Webview): string {
       el.style.color = isError ? '#b00020' : '#555';
     }
 
+    function setFreeResourceWarning(text) {
+      const el = document.getElementById('freeResourceWarning');
+      if (!el) return;
+      el.textContent = text || '';
+    }
+
     function setProfileStatus(text, isError) {
       const el = document.getElementById('profileStatus');
       if (!el) return;
@@ -5025,6 +5039,55 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (settingHint) settingHint.textContent = text;
       const statusHint = document.getElementById('sshIncludeStatus');
       if (statusHint) statusHint.textContent = text;
+    }
+
+    function setClusterInfoFetchedAt(value) {
+      if (!value) {
+        clusterInfoFetchedAt = null;
+        return;
+      }
+      const parsed = value instanceof Date ? value : new Date(value);
+      const time = parsed.getTime();
+      clusterInfoFetchedAt = Number.isFinite(time) ? time : null;
+    }
+
+    function formatAgeLabel(ageMs) {
+      const totalMinutes = Math.floor(ageMs / 60000);
+      if (totalMinutes < 1) {
+        return 'moments';
+      }
+      if (totalMinutes < 60) {
+        return totalMinutes + ' minute' + (totalMinutes === 1 ? '' : 's');
+      }
+      const totalHours = Math.floor(totalMinutes / 60);
+      if (totalHours < 24) {
+        return totalHours + ' hour' + (totalHours === 1 ? '' : 's');
+      }
+      const totalDays = Math.floor(totalHours / 24);
+      return totalDays + ' day' + (totalDays === 1 ? '' : 's');
+    }
+
+    function updateFreeResourceWarning() {
+      if (!clusterInfo || !clusterInfo.partitions) {
+        setFreeResourceWarning('');
+        return;
+      }
+      if (!Boolean(getValue('filterFreeResources'))) {
+        setFreeResourceWarning('');
+        return;
+      }
+      const hasFreeData = clusterInfo.partitions.some((partition) => hasFreeResourceData(partition));
+      if (!hasFreeData || !clusterInfoFetchedAt) {
+        setFreeResourceWarning('');
+        return;
+      }
+      const ageMs = Date.now() - clusterInfoFetchedAt;
+      if (!Number.isFinite(ageMs) || ageMs < FREE_RESOURCE_STALE_MS) {
+        setFreeResourceWarning('');
+        return;
+      }
+      const ageLabel = formatAgeLabel(ageMs);
+      setFreeResourceWarning('Free resource data is ' + ageLabel + ' old. Click "Get cluster info" to refresh.');
     }
 
     function setConnectState(state) {
@@ -5554,6 +5617,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
         preserved[key] = getValue(key);
       });
       clusterInfo = null;
+      setClusterInfoFetchedAt(null);
+      setFreeResourceWarning('');
       setResourceDisabled(false);
       clearResourceOptions();
       setModuleOptions([]);
@@ -5821,6 +5886,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const manualPartition = getValue('defaultPartition');
       clusterInfo = info;
       setModuleOptions(info && Array.isArray(info.modules) ? info.modules : []);
+      updateFreeResourceWarning();
       if (!info || !info.partitions || info.partitions.length === 0) {
         setStatus('No partitions found.', true);
         clearResourceOptions();
@@ -5946,6 +6012,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         applyModuleState(values);
         updateSshIncludeHints();
         if (message.clusterInfo) {
+          setClusterInfoFetchedAt(message.clusterInfoCachedAt);
           applyClusterInfo(message.clusterInfo);
           if (message.clusterInfoCachedAt) {
             const cachedAt = new Date(message.clusterInfoCachedAt).toLocaleString();
@@ -5953,6 +6020,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           }
         } else {
           clusterInfo = null;
+          setClusterInfoFetchedAt(null);
           clearResourceOptions();
           const meta = document.getElementById('partitionMeta');
           if (meta) meta.textContent = '';
@@ -5963,6 +6031,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         applyMessageState(message);
         suppressAutoSave = false;
       } else if (message.command === 'clusterInfo') {
+        setClusterInfoFetchedAt(message.fetchedAt || new Date());
         applyClusterInfo(message.info);
         applyMessageState(message);
       } else if (message.command === 'clusterInfoError') {
@@ -6145,6 +6214,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
         }
       });
     }
+
+    setInterval(() => {
+      updateFreeResourceWarning();
+    }, 60000);
 
     const includeToggle = document.getElementById('useSshIncludeBlock');
     if (includeToggle) {
