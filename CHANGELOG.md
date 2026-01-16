@@ -8,6 +8,8 @@ All notable changes to this project are documented in this file based on git tag
 ### Changed
 - Default session mode is now persistent with a 10-minute idle timeout (set to 0 to disable).
 - Persistent session state is now namespaced by username under `sessionStateDir/sessions/<user>` to avoid collisions on shared filesystems (legacy layout still supported).
+- The extension prompts to disable `remote.SSH.useExecServer` when persistent sessions are enabled to improve reconnect reliability.
+- Documented that window reloads stop debug sessions; use attach workflows to reconnect in persistent allocations.
 
 ## 0.3.4 - 2026-01-14
 ### Added

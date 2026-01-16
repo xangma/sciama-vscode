@@ -1513,7 +1513,7 @@ async function connectCommand(
   let tempConfigPath: string | undefined;
   let usedLegacyConfig = false;
 
-  await ensureRemoteSshSettings();
+  await ensureRemoteSshSettings(cfg.sessionMode);
   await migrateStaleRemoteSshConfigIfNeeded();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const currentRemoteConfig = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
@@ -4427,7 +4427,7 @@ async function ensureLocalServerSetting(): Promise<void> {
 }
 
 
-async function ensureRemoteSshSettings(): Promise<void> {
+async function ensureRemoteSshSettings(sessionMode?: SessionMode): Promise<void> {
   await ensureLocalServerSetting();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const enableRemoteCommand = remoteCfg.get<boolean>('enableRemoteCommand', false);
@@ -4451,6 +4451,18 @@ async function ensureRemoteSshSettings(): Promise<void> {
     );
     if (enable === 'Enable') {
       await remoteCfg.update('lockfilesInTmp', true, vscode.ConfigurationTarget.Global);
+    }
+  }
+
+  const useExecServer = remoteCfg.get<boolean>('useExecServer', true);
+  if (useExecServer && sessionMode === 'persistent') {
+    const disable = await vscode.window.showWarningMessage(
+      'Remote.SSH: Use Exec Server is enabled. This can prevent reconnecting to persistent Slurm sessions.',
+      'Disable',
+      'Ignore'
+    );
+    if (disable === 'Disable') {
+      await remoteCfg.update('useExecServer', false, vscode.ConfigurationTarget.Global);
     }
   }
 }
@@ -5291,7 +5303,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="sessionKey" type="text" placeholder="Defaults to SSH alias" />
     <label for="sessionIdleTimeoutSeconds">Session idle timeout (seconds, 0 = never)</label>
     <input id="sessionIdleTimeoutSeconds" type="number" min="0" placeholder="600" />
-    <div class="hint">Set to 0 to disable auto-cancel.</div>
     <label for="sessionStateDir">Session state directory (optional)</label>
     <input id="sessionStateDir" type="text" placeholder="~/.slurm-connect" />
     <label for="sshHostPrefix">SSH host prefix</label>

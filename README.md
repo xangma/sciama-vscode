@@ -118,6 +118,10 @@ Session state is stored under `sessionStateDir/sessions/<username>/<sessionKey>`
 shared filesystems. Legacy sessions that live directly under `sessionStateDir/sessions/<sessionKey>` are still
 recognized.
 
+Note: Reloading the VS Code window stops active debug sessions (the debugger is owned by the VS Code process).
+If you want a debug session to survive a reconnect, start your app with `debugpy` (or similar) and use an
+**attach** configuration when you reconnect to the persistent allocation.
+
 ### Remote folder (recommended)
 If you forget to set a remote folder, VS Code may reconnect and create a new Slurm job when you later open a folder. To avoid that, you should set a remote folder up front in the side panel, set **Remote folder** (recommended).
 
@@ -126,6 +130,7 @@ If you forget to set a remote folder, VS Code may reconnect and create a new Slu
 - Ensure **Remote.SSH: Enable Remote Command** is enabled (the extension will prompt to enable it).
 - **Remote.SSH: Lockfiles In Tmp** is recommended on shared filesystems (the extension will prompt to enable it).
 - The extension will also prompt to put `"remote.SSH.useLocalServer": true` in your vscode settings file if you're on Windows due to a bug with the Remote-SSH extension not respecting the default value from the GUI.
+- `remote.SSH.useExecServer` may need to be disabled to reliably reconnect to persistent Slurm sessions (the extension will prompt).
 - This extension installs a managed Include block (with a note) in your SSH config that points at the Slurm Connect include file and updates that file on each connection.
 - The include file path defaults to `~/.ssh/slurm-connect.conf` and can be overridden with `slurmConnect.temporarySshConfigPath`.
 - When updating your SSH config, the extension writes a timestamped backup alongside it (prefixed with `.slurm-connect.backup-`).
