@@ -10,6 +10,7 @@ import {
   formatSshConfigValue
 } from '../utils/sshConfig';
 import { parsePartitionInfoOutput } from '../utils/clusterInfo';
+import { joinShellCommand, splitShellArgs } from '../utils/shellArgs';
 
 function testFormatSshConfigValue(): void {
   assert.strictEqual(formatSshConfigValue('simple'), 'simple');
@@ -71,6 +72,26 @@ function testParsePartitionInfoOutputNodeNames(): void {
   assert.strictEqual(infoWithCount.partitions[0].nodes, 10);
 }
 
+function testSplitShellArgsQuoted(): void {
+  const tokens = splitShellArgs('--comment "foo bar" --mem=32G');
+  assert.deepStrictEqual(tokens, ['--comment', 'foo bar', '--mem=32G']);
+}
+
+function testSplitShellArgsComma(): void {
+  const tokens = splitShellArgs('--gres=gpu:1, --mem=32G');
+  assert.deepStrictEqual(tokens, ['--gres=gpu:1', '--mem=32G']);
+}
+
+function testJoinShellCommandQuotes(): void {
+  const cmd = joinShellCommand(['python', '/path with space', '--session-state-dir=/tmp/foo bar']);
+  assert.strictEqual(cmd, "python '/path with space' '--session-state-dir=/tmp/foo bar'");
+}
+
+function testJoinShellCommandOperators(): void {
+  const cmd = joinShellCommand(['echo', 'hi', '&&', 'echo', 'bye']);
+  assert.strictEqual(cmd, 'echo hi && echo bye');
+}
+
 function run(): void {
   testFormatSshConfigValue();
   testBuildHostEntryQuotes();
@@ -78,6 +99,10 @@ function run(): void {
   testBuildSlurmConnectIncludeHelpers();
   testExpandHome();
   testParsePartitionInfoOutputNodeNames();
+  testSplitShellArgsQuoted();
+  testSplitShellArgsComma();
+  testJoinShellCommandQuotes();
+  testJoinShellCommandOperators();
   console.log('extension tests passed');
 }
 

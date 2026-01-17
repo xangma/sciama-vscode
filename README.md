@@ -57,7 +57,8 @@ Toggle in the UI or via `slurmConnect.filterFreeResources`.
 Profiles let you save and switch between sets of Slurm Connect inputs (login host, identity file, partitions,
 resource defaults, module selections, etc.). Use **Save profile** to store the current form values, **Load** to
 apply a saved profile, and **Delete** to remove one you no longer need. Profiles are stored in the extension
-state and do not change your VS Code settings.
+state and do not change your VS Code settings. Loading a profile fills the form once; subsequent reloads keep
+your last edits instead of reapplying the active profile.
 
 ### SSH authentication for cluster info
 Cluster info queries use non-interactive SSH (`BatchMode=yes`). If your key is encrypted, you can either use ssh-agent or enter the passphrase in a terminal when prompted.
@@ -147,7 +148,7 @@ If you forget to set a remote folder, VS Code may reconnect and create a new Slu
 - Set `slurmConnect.useSshIncludeBlock` to false to use the legacy temporary Remote.SSH configFile override instead.
 - Use `slurmConnect.openInNewWindow` to control whether the connection opens in a new window (default: false).
 - `slurmConnect.partitionInfoCommand` controls how cluster info is fetched (default: `sinfo -h -N -o "%P|%n|%c|%m|%G"`).
-- To add GPUs or other flags, use `slurmConnect.extraSallocArgs` (e.g. `["--gres=gpu:1"]`).
+- To add GPUs or other flags, use `slurmConnect.extraSallocArgs` (e.g. `["--gres=gpu:1"]`). The UI field supports shell-style quoting for multi-word values (e.g. `--comment "foo bar"`).
 
 ## Issues
 Please report bugs and feature requests on the GitHub repository:

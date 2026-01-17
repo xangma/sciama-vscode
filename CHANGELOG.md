@@ -2,33 +2,53 @@
 All notable changes to this project are documented in this file based on git tags and commit history.
 
 ## Unreleased
+
+## 0.4.3 - 2026-01-17
+### Changed
+- Extra salloc args in the UI now honor shell-style quoting for multi-word values.
+- Loading a profile now applies once; subsequent reloads keep your last edits instead of reapplying the active profile.
+### Fixed
+- Remote folder paths with spaces or special characters now open reliably after connect.
+- Terminal-based SSH passphrase entry no longer times out while waiting for completion.
+- RemoteCommand assembly now quotes proxy/session args to avoid failures with spaces.
+- Free-resource filtering now attributes shared nodes to all partitions they belong to.
+- Connecting to an existing session now uses the session key as the SSH alias to keep Remote-SSH caching consistent.
+
+## 0.4.2 - 2026-01-17
+### Changed
+- Version bump only (no user-visible changes).
+
+## 0.4.1 - 2026-01-16
+### Added
+- SSH config host picker that can resolve a selected host and auto-fill login host/user/identity fields.
+### Changed
+- SSH identity file is now optional; authentication warnings appear after failures instead of on connect.
+
+## 0.4.0 - 2026-01-16
 ### Added
 - Persistent session mode for Slurm allocations, with configurable session keys, idle timeouts, and state directory settings.
 - Existing session selector in the cluster info UI, allowing connections to reuse a running allocation.
-- SSH config host picker that can resolve a selected host and auto-fill login host/user/identity fields.
+- Collapsible webview sections for connection/resource/profiles/advanced settings, with expansion state persistence.
+- New connection options to open in a new window and to set a remote workspace path.
+- Resource warning hints for invalid or likely-to-fail Slurm requests.
 ### Changed
 - Default session mode is now persistent with a 10-minute idle timeout (set to 0 to disable).
 - Persistent session state is now namespaced by username under `sessionStateDir/sessions/<user>` to avoid collisions on shared filesystems (legacy layout still supported).
 - The extension prompts to disable `remote.SSH.useExecServer` when persistent sessions are enabled to improve reconnect reliability.
-- Documented that window reloads stop debug sessions; use attach workflows to reconnect in persistent allocations.
 - Get cluster info always collects free-resource data in the single SSH call; the toggle only filters UI suggestions.
 - Updated the cluster info hint text to reflect free-resource data collection and filtering behavior.
-- SSH identity file is now optional; authentication warnings appear after failures instead of on connect.
 ### Fixed
 - SSH config Include block is now pinned to the top of the SSH config so the Slurm Connect hosts are read before other host entries.
 - Module load commands now shell-escape module names with special characters to avoid RemoteCommand parsing errors.
 - Module lists now show default markers from `module avail` while stripping them from module load selections.
+- Wall-time validation ignores hidden characters and punctuation, preventing false warnings.
+### Docs
+- Documented that window reloads stop debug sessions; use attach workflows to reconnect in persistent allocations.
 
 ## 0.3.4 - 2026-01-14
 ### Added
 - Stale-data warning for free-resource filtering to prompt refreshes.
 - Module list section headers as non-selectable dividers, with section-aware searching.
-- Webview remembers collapsed/expanded states for connection/resource/profiles/advanced sections.
-- Resource warning hints for invalid or likely-to-fail Slurm requests.
-
-### Fixed
-- Wall-time validation ignores hidden characters and punctuation, preventing false warnings.
-
 ### Fixed
 - Module list parsing now strips terminal control codes and legend markers from `module -t avail`.
 

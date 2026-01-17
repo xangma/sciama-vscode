@@ -21,6 +21,7 @@ import {
   hasMeaningfulClusterInfo,
   parsePartitionInfoOutput
 } from './utils/clusterInfo';
+import { isShellOperatorToken, joinShellCommand, quoteShellArg, splitShellArgs } from './utils/shellArgs';
 
 const execFileAsync = promisify(execFile);
 
@@ -1152,14 +1153,9 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           syncConnectionStateFromEnvironment();
           let activeProfile = getActiveProfileName();
           const defaults = getUiValuesFromStorage();
-          let values = defaults;
-          if (activeProfile) {
-            const stored = getProfileValues(activeProfile);
-            if (stored) {
-              values = { ...defaults, ...stored } as UiValues;
-            } else {
-              activeProfile = undefined;
-            }
+          const values = defaults;
+          if (activeProfile && !getProfileValues(activeProfile)) {
+            activeProfile = undefined;
           }
           const agentStatus = await buildAgentStatusMessage(values.identityFile);
           const host = firstLoginHostFromInput(values.loginHosts);
@@ -1195,7 +1191,10 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             overrides.sessionMode = 'persistent';
             overrides.sessionKey = sessionSelection;
           }
-          const connected = await connectCommand(overrides, { interactive: false });
+          const connected = await connectCommand(overrides, {
+            interactive: false,
+            aliasOverride: sessionSelection
+          });
           setConnectionState(connected ? 'connected' : 'idle');
           break;
         }
@@ -1434,7 +1433,7 @@ async function maybeWarnLegacySshConfigOverride(cfg: SlurmConnectConfig): Promis
 
 async function connectCommand(
   overrides?: Partial<SlurmConnectConfig>,
-  options?: { interactive?: boolean }
+  options?: { interactive?: boolean; aliasOverride?: string }
 ): Promise<boolean> {
   const cfg = getConfigWithOverrides(overrides);
   const interactive = options?.interactive !== false;
@@ -1580,8 +1579,9 @@ async function connectCommand(
   });
 
   const defaultAlias = buildDefaultAlias(cfg.sshHostPrefix || 'slurm', loginHost, partition, nodes, cpusPerTask);
-  let alias = defaultAlias;
-  if (interactive) {
+  const aliasOverride = options?.aliasOverride ? options.aliasOverride.trim() : '';
+  let alias = aliasOverride || defaultAlias;
+  if (interactive && !aliasOverride) {
     const aliasInput = await vscode.window.showInputBox({
       title: 'SSH host alias',
       value: defaultAlias,
@@ -1592,6 +1592,9 @@ async function connectCommand(
       return false;
     }
     alias = aliasInput.trim();
+  }
+  if (!alias) {
+    alias = defaultAlias;
   }
 
   lastConnectionAlias = alias.trim();
@@ -2596,16 +2599,6 @@ function buildSshArgs(
   return args;
 }
 
-function quoteShellArg(value: string): string {
-  if (value === '') {
-    return "''";
-  }
-  if (/^[A-Za-z0-9_./:@%+=-]+$/.test(value)) {
-    return value;
-  }
-  return "'" + value.replace(/'/g, "'\\''") + "'";
-}
-
 function quotePowerShellString(value: string): string {
   return "'" + value.replace(/'/g, "''") + "'";
 }
@@ -2634,22 +2627,15 @@ async function createTerminalSshRunFiles(): Promise<{
   };
 }
 
-async function waitForFile(filePath: string, timeoutMs: number, pollMs: number): Promise<boolean> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
+async function waitForFile(filePath: string, pollMs: number): Promise<void> {
+  while (true) {
     try {
       await fs.access(filePath);
-      return true;
+      return;
     } catch {
       // Keep waiting.
     }
     await delay(pollMs);
-  }
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -2694,10 +2680,7 @@ async function runSshCommandInTerminal(
   let stdout = '';
   let exitCode = NaN;
   try {
-    const completed = await waitForFile(statusPath, cfg.sshConnectTimeoutSeconds * 1000, 500);
-    if (!completed) {
-      throw new Error('Timed out waiting for SSH to finish in the terminal.');
-    }
+    await waitForFile(statusPath, 500);
     const statusText = await fs.readFile(statusPath, 'utf8');
     exitCode = Number(statusText.trim());
     try {
@@ -3706,32 +3689,34 @@ function computeFreeResourceSummary(
       }
       freeGpuTotal += free;
     }
-    const partition = node.partitions[0] ? normalizePartitionName(node.partitions[0]) : 'unknown';
-    if (!partition) {
-      continue;
-    }
-    const entry = summary.get(partition) || {
-      freeNodes: 0,
-      freeCpuTotal: 0,
-      freeCpusPerNode: 0,
-      freeGpuTotal: 0,
-      freeGpuMax: 0,
-      freeGpuTypes: {}
-    };
-    if (freeCpu > 0) {
-      entry.freeNodes += 1;
-    }
-    entry.freeCpuTotal += freeCpu;
-    entry.freeCpusPerNode = Math.max(entry.freeCpusPerNode, freeCpu);
-    entry.freeGpuTotal += freeGpuTotal;
-    entry.freeGpuMax = Math.max(entry.freeGpuMax, freeGpuTotal);
-    for (const [type, free] of Object.entries(nodeFreeGpuTypes)) {
-      const current = entry.freeGpuTypes[type] || 0;
-      if (free > current) {
-        entry.freeGpuTypes[type] = free;
+    const partitions = node.partitions.length
+      ? node.partitions.map((entry) => normalizePartitionName(entry)).filter(Boolean)
+      : ['unknown'];
+    const uniquePartitions = Array.from(new Set(partitions));
+    for (const partition of uniquePartitions) {
+      const entry = summary.get(partition) || {
+        freeNodes: 0,
+        freeCpuTotal: 0,
+        freeCpusPerNode: 0,
+        freeGpuTotal: 0,
+        freeGpuMax: 0,
+        freeGpuTypes: {}
+      };
+      if (freeCpu > 0) {
+        entry.freeNodes += 1;
       }
+      entry.freeCpuTotal += freeCpu;
+      entry.freeCpusPerNode = Math.max(entry.freeCpusPerNode, freeCpu);
+      entry.freeGpuTotal += freeGpuTotal;
+      entry.freeGpuMax = Math.max(entry.freeGpuMax, freeGpuTotal);
+      for (const [type, free] of Object.entries(nodeFreeGpuTypes)) {
+        const current = entry.freeGpuTypes[type] || 0;
+        if (free > current) {
+          entry.freeGpuTypes[type] = free;
+        }
+      }
+      summary.set(partition, entry);
     }
-    summary.set(partition, entry);
   }
 
   return summary;
@@ -3958,10 +3943,6 @@ function buildProxyArgs(cfg: SlurmConnectConfig, sessionKey?: string): string[] 
   return args.concat(sessionArgs);
 }
 
-function isShellOperatorToken(token: string): boolean {
-  return token === '&&' || token === '||' || token === ';' || token === '|' || token === '&';
-}
-
 function escapeModuleLoadCommand(command: string): string {
   const trimmed = command.trim();
   if (!trimmed) {
@@ -4033,13 +4014,13 @@ function escapeModuleLoadCommand(command: string): string {
 }
 
 function buildRemoteCommand(cfg: SlurmConnectConfig, sallocArgs: string[], sessionKey?: string): string {
-  const proxyParts = [cfg.proxyCommand, ...buildProxyArgs(cfg, sessionKey)];
-  const proxyCommand = proxyParts.filter(Boolean).join(' ').trim();
-  if (!proxyCommand) {
+  const proxyTokens = splitShellArgs(cfg.proxyCommand);
+  if (proxyTokens.length === 0) {
     return '';
   }
+  const proxyArgs = buildProxyArgs(cfg, sessionKey);
   const sallocFlags = sallocArgs.map((arg) => `--salloc-arg=${arg}`);
-  const fullProxyCommand = [proxyCommand, ...sallocFlags].join(' ').trim();
+  const fullProxyCommand = joinShellCommand([...proxyTokens, ...proxyArgs, ...sallocFlags]);
   const moduleLoad = cfg.moduleLoad ? escapeModuleLoadCommand(cfg.moduleLoad) : '';
   const baseCommand = moduleLoad
     ? `${moduleLoad} && ${fullProxyCommand}`.trim()
@@ -5065,9 +5046,11 @@ async function connectToHost(
   if (trimmedPath) {
     const normalizedPath = trimmedPath.startsWith('/') ? trimmedPath : `/${trimmedPath}`;
     try {
-      const remoteUri = vscode.Uri.parse(
-        `vscode-remote://ssh-remote+${encodeURIComponent(alias)}${normalizedPath}`
-      );
+      const remoteUri = vscode.Uri.from({
+        scheme: 'vscode-remote',
+        authority: `ssh-remote+${encodeURIComponent(alias)}`,
+        path: normalizedPath
+      });
       log.appendLine(`Opening remote folder: ${remoteUri.toString()}`);
       await vscode.commands.executeCommand('vscode.openFolder', remoteUri, openInNewWindow);
       return true;
@@ -5348,7 +5331,7 @@ function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConne
   }
   if (has('proxyCommand')) overrides.proxyCommand = String(values.proxyCommand ?? '').trim();
   if (has('proxyArgs')) overrides.proxyArgs = parseListInput(String(values.proxyArgs ?? ''));
-  if (has('extraSallocArgs')) overrides.extraSallocArgs = parseListInput(String(values.extraSallocArgs ?? ''));
+  if (has('extraSallocArgs')) overrides.extraSallocArgs = splitShellArgs(String(values.extraSallocArgs ?? ''));
   if (has('sessionMode')) overrides.sessionMode = normalizeSessionMode(String(values.sessionMode ?? ''));
   if (has('sessionKey')) overrides.sessionKey = String(values.sessionKey ?? '').trim();
   if (has('sessionIdleTimeoutSeconds')) {
@@ -5384,7 +5367,7 @@ function uniqueList(values: string[]): string[] {
 }
 
 function splitArgs(input: string): string[] {
-  return input.split(/\s+/).filter(Boolean);
+  return splitShellArgs(input);
 }
 
 function delay(ms: number): Promise<void> {
@@ -5491,7 +5474,7 @@ function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
     moduleLoad: resolvedModuleLoad,
     proxyCommand: values.proxyCommand.trim(),
     proxyArgs: parseListInput(values.proxyArgs),
-    extraSallocArgs: parseListInput(values.extraSallocArgs),
+    extraSallocArgs: splitShellArgs(values.extraSallocArgs),
     promptForExtraSallocArgs: Boolean(values.promptForExtraSallocArgs),
     sessionMode: normalizeSessionMode(values.sessionMode),
     sessionKey: values.sessionKey.trim(),
