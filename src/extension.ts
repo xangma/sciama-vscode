@@ -104,6 +104,9 @@ let extensionWorkspaceState: vscode.Memento | undefined;
 let activeWebview: vscode.Webview | undefined;
 let connectionState: ConnectionState = 'idle';
 let lastConnectionAlias: string | undefined;
+let lastConnectionSessionKey: string | undefined;
+let lastConnectionSessionMode: SessionMode | undefined;
+let lastConnectionLoginHost: string | undefined;
 let lastSshAuthPrompt: { identityPath: string; timestamp: number; mode: SshAuthMode } | undefined;
 let clusterInfoRequestInFlight = false;
 let sshHostsRequestInFlight = false;
@@ -888,7 +891,11 @@ async function refreshAgentStatus(identityFile: string): Promise<void> {
 
 function setConnectionState(state: ConnectionState): void {
   connectionState = state;
-  postToWebview({ command: 'connectionState', state });
+  postToWebview({
+    command: 'connectionState',
+    state,
+    sessionMode: lastConnectionSessionMode
+  });
 }
 
 function resolveRemoteSshAlias(): string | undefined {
@@ -918,6 +925,16 @@ function syncConnectionStateFromEnvironment(): void {
     const alias = resolveRemoteSshAlias();
     if (alias) {
       lastConnectionAlias = alias;
+    }
+    const cfg = getConfig();
+    if (!lastConnectionSessionMode) {
+      lastConnectionSessionMode = cfg.sessionMode;
+    }
+    if (!lastConnectionSessionKey && alias) {
+      lastConnectionSessionKey = resolveSessionKey(cfg, alias);
+    }
+    if (!lastConnectionLoginHost && cfg.loginHosts.length > 0) {
+      lastConnectionLoginHost = cfg.loginHosts[0];
     }
     return;
   }
@@ -1351,6 +1368,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiDefaultsFromConfig()),
             activeProfile,
             connectionState,
+            connectionSessionMode: lastConnectionSessionMode,
             agentStatus: agentStatus.text,
             agentStatusError: agentStatus.isError,
             remoteActive: vscode.env.remoteName === 'ssh-remote',
@@ -1440,7 +1458,44 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
         case 'disconnect': {
           setConnectionState('disconnecting');
           const disconnected = await disconnectFromHost(lastConnectionAlias);
+          if (disconnected) {
+            lastConnectionSessionKey = undefined;
+            lastConnectionSessionMode = undefined;
+            lastConnectionLoginHost = undefined;
+          }
           setConnectionState(disconnected ? 'idle' : 'connected');
+          break;
+        }
+        case 'cancelSession': {
+          if (lastConnectionSessionMode !== 'persistent') {
+            void vscode.window.showWarningMessage('No persistent Slurm session is active to cancel.');
+            break;
+          }
+          const label = lastConnectionSessionKey || lastConnectionAlias || 'current session';
+          const choice = await vscode.window.showWarningMessage(
+            `Cancel job "${label}"? This will end the allocation and close the remote connection. Close this dialog to keep it running.`,
+            { modal: true },
+            'Cancel job'
+          );
+          if (choice !== 'Cancel job') {
+            break;
+          }
+          const cfg = getConfig();
+          const sessionKey =
+            lastConnectionSessionKey ||
+            (lastConnectionAlias ? resolveSessionKey(cfg, lastConnectionAlias) : '');
+          const loginHost =
+            lastConnectionLoginHost ||
+            (cfg.loginHosts.length > 0 ? cfg.loginHosts[0] : undefined);
+          if (loginHost && sessionKey) {
+            await cancelPersistentSessionJob(loginHost, sessionKey, cfg, {
+              useTerminal: true
+            });
+          } else {
+            void vscode.window.showWarningMessage(
+              'Unable to resolve the login host or session key to cancel the Slurm job.'
+            );
+          }
           break;
         }
         case 'saveProfile': {
@@ -1829,6 +1884,15 @@ async function connectCommand(
     cfg.remoteWorkspacePath
   );
   didConnect = connected;
+  if (connected) {
+    lastConnectionSessionKey = sessionKey || undefined;
+    lastConnectionSessionMode = cfg.sessionMode;
+    lastConnectionLoginHost = loginHost;
+  } else {
+    lastConnectionSessionKey = undefined;
+    lastConnectionSessionMode = undefined;
+    lastConnectionLoginHost = undefined;
+  }
   if (!connected) {
     void vscode.window.showWarningMessage(
       `SSH host "${alias.trim()}" created, but auto-connect failed. Use Remote-SSH to connect.`,
@@ -2200,7 +2264,8 @@ function buildSessionQueryCommand(stateDir: string): string {
     '    })',
     'print(json.dumps(sessions))'
   ].join('\n');
-  return `python3 - <<'PY'\n${script}\nPY`;
+  const encodedScript = Buffer.from(script, 'utf8').toString('base64');
+  return wrapPythonScriptCommand(encodedScript, '"[]"');
 }
 
 function parseSessionListOutput(output: string): SessionSummary[] {
@@ -4061,6 +4126,147 @@ function resolveSessionKey(cfg: SlurmConnectConfig, alias: string): string {
   return alias.trim();
 }
 
+function wrapPythonScriptCommand(encodedScript: string, emptyFallback: string): string {
+  const lines = [
+    'set -e',
+    'PYTHON=$(command -v python3 || command -v python || true)',
+    'if [ -z "$PYTHON" ]; then',
+    `  echo ${emptyFallback}`,
+    '  exit 0',
+    'fi',
+    `printf %s ${encodedScript} | base64 -d | "$PYTHON" -`
+  ];
+  const script = lines.join('\n');
+  return `bash -lc ${quoteShellArg(script)}`;
+}
+
+function buildSessionJobLookupScript(stateDir: string, sessionKey: string): string {
+  const dirLiteral = JSON.stringify(stateDir);
+  const keyLiteral = JSON.stringify(sessionKey);
+  return [
+    'import json, os, subprocess, sys, re',
+    `state_dir = os.path.expanduser(${dirLiteral})`,
+    `raw_key = ${keyLiteral}`,
+    'def sanitize(value):',
+    '    trimmed = (value or "").strip()',
+    '    if not trimmed:',
+    '        return "default"',
+    '    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", trimmed).strip(".-")',
+    '    sanitized = sanitized or "default"',
+    '    return sanitized[:64]',
+    'sessions_dir = os.path.join(state_dir, "sessions")',
+    'safe_key = sanitize(raw_key)',
+    'try:',
+    '    user = os.environ.get("USER") or subprocess.check_output(["id", "-un"], text=True).strip()',
+    'except Exception:',
+    '    user = None',
+    'safe_user = sanitize(user or "unknown")',
+    'candidates = []',
+    'user_root = os.path.join(sessions_dir, safe_user)',
+    'if os.path.isdir(user_root):',
+    '    candidates.append(os.path.join(user_root, safe_key, "job.json"))',
+    'candidates.append(os.path.join(sessions_dir, safe_key, "job.json"))',
+    'job_id = ""',
+    'for path in candidates:',
+    '    if not os.path.isfile(path):',
+    '        continue',
+    '    try:',
+    '        with open(path, "r") as handle:',
+    '            data = json.load(handle)',
+    '        job_id = str(data.get("job_id") or "").strip()',
+    '        if job_id:',
+    '            break',
+    '    except Exception:',
+    '        pass',
+    'if not job_id:',
+    '    search_roots = []',
+    '    if os.path.isdir(user_root):',
+    '        search_roots.append(user_root)',
+    '    if os.path.isdir(sessions_dir):',
+    '        search_roots.append(sessions_dir)',
+    '    for root in search_roots:',
+    '        for entry in sorted(os.listdir(root)):',
+    '            path = os.path.join(root, entry, "job.json")',
+    '            if not os.path.isfile(path):',
+    '                continue',
+    '            try:',
+    '                with open(path, "r") as handle:',
+    '                    data = json.load(handle)',
+    '            except Exception:',
+    '                continue',
+    '            entry_key = str(data.get("session_key") or entry).strip()',
+    '            if entry_key == raw_key or sanitize(entry_key) == safe_key:',
+    '                job_id = str(data.get("job_id") or "").strip()',
+    '                if job_id:',
+    '                    break',
+    '        if job_id:',
+    '            break',
+    'print(job_id)'
+  ].join('\n');
+}
+
+function buildLocalCancelPersistentSessionCommand(stateDir: string, sessionKey: string): string {
+  const script = buildSessionJobLookupScript(stateDir, sessionKey);
+  return [
+    'set +e',
+    'JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-}}"',
+    'if [ -n "$JOB_ID" ]; then',
+    '  echo "Slurm Connect: cancelling job $JOB_ID (from SLURM_JOB_ID)"',
+    '  scancel "$JOB_ID"',
+    '  exit $?',
+    'fi',
+    'PYTHON=$(command -v python3 || command -v python || true)',
+    'if [ -z "$PYTHON" ]; then',
+    '  echo "Slurm Connect: python not available to resolve session job."',
+    '  exit 1',
+    'fi',
+    'JOB_ID=$("$PYTHON" - <<\'PY\'',
+    script,
+    'PY',
+    ')',
+    'JOB_ID=$(printf "%s" "$JOB_ID" | tr -d "\\r" | tail -n 1)',
+    'if [ -z "$JOB_ID" ]; then',
+    '  echo "Slurm Connect: no session job found."',
+    '  exit 1',
+    'fi',
+    'echo "Slurm Connect: cancelling job $JOB_ID"',
+    'scancel "$JOB_ID"'
+  ].join('\n');
+}
+
+async function cancelPersistentSessionJob(
+  loginHost: string,
+  sessionKey: string,
+  cfg: SlurmConnectConfig,
+  options?: { useTerminal?: boolean }
+): Promise<boolean> {
+  const log = getOutputChannel();
+  try {
+    const stateDir = cfg.sessionStateDir.trim() || DEFAULT_SESSION_STATE_DIR;
+    if (vscode.env.remoteName === 'ssh-remote') {
+      const localCommand = buildLocalCancelPersistentSessionCommand(stateDir, sessionKey);
+      log.appendLine(`Cancelling session "${sessionKey}" in remote terminal.`);
+      const terminal = vscode.window.createTerminal({ name: 'Slurm Connect Cancel' });
+      terminal.show(true);
+      terminal.sendText(localCommand, true);
+      void vscode.window.showInformationMessage(
+        `Cancel command sent to the terminal. Check terminal output to confirm cancellation for "${sessionKey}".`
+      );
+      return true;
+    }
+    // NOTE: Non-remote cancel path is disabled for now; cancel works only when connected.
+    void vscode.window.showWarningMessage(
+      'Cancel job is only supported from an active remote session. Connect to the session first.'
+    );
+    return false;
+  } catch (error) {
+    const message = `Failed to cancel session ${sessionKey}: ${formatError(error)}`;
+    log.appendLine(message);
+    void vscode.window.showErrorMessage(message);
+    return false;
+  }
+}
+
 function buildProxyArgs(cfg: SlurmConnectConfig, sessionKey?: string): string[] {
   const args = cfg.proxyArgs.filter(Boolean);
   if (cfg.sessionMode !== 'persistent') {
@@ -5656,7 +5862,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .buttons button { flex: 1; }
     .cluster-actions { align-items: center; }
     .cluster-actions button { flex: 0 0 auto; }
-    .hidden { display: none; }
+    .hidden { display: none !important; }
     .hint { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
     .hint:empty { display: none; }
     .field-hint { margin-top: 2px; }
@@ -6142,7 +6348,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
   <div class="action-bar">
     <div class="action-main">
       <button id="connectToggle">Connect</button>
-      <div class="action-options checkbox">
+      <button id="cancelJob" type="button" class="button-secondary hidden">Cancel job (disconnects)</button>
+      <div id="openInNewWindowWrap" class="action-options checkbox">
         <input id="openInNewWindow" type="checkbox" />
         <label for="openInNewWindow">Open in new window</label>
       </div>
@@ -6168,6 +6375,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     let selectedModules = [];
     let customModuleCommand = '';
     let uiDefaults = null;
+    let connectedSessionMode = '';
     let sshHosts = [];
     let sshHostSource = '';
     let lastResolvedSshHost = '';
@@ -6741,7 +6949,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function setConnectState(state) {
       connectionState = state || 'idle';
       const button = document.getElementById('connectToggle');
+      const cancelOnlyButton = document.getElementById('cancelJob');
       const status = document.getElementById('connectStatus');
+      const openInNewWindowWrap = document.getElementById('openInNewWindowWrap');
       if (!button || !status) return;
       let label = 'Connect';
       let disabled = false;
@@ -6761,6 +6971,14 @@ function getWebviewHtml(webview: vscode.Webview): string {
       button.textContent = label;
       button.disabled = disabled;
       status.textContent = statusText;
+      if (openInNewWindowWrap) {
+        openInNewWindowWrap.classList.toggle('hidden', connectionState !== 'idle');
+      }
+      if (cancelOnlyButton) {
+        const canCancelOnly = connectionState === 'connected' && connectedSessionMode === 'persistent';
+        cancelOnlyButton.classList.toggle('hidden', !canCancelOnly);
+        cancelOnlyButton.disabled = !canCancelOnly || disabled;
+      }
     }
 
 
@@ -8373,6 +8591,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         if (message.defaults) {
           uiDefaults = message.defaults;
         }
+        connectedSessionMode = message.connectionSessionMode || '';
         if (message.profileSummaries) {
           profileSummaries = message.profileSummaries;
         }
@@ -8440,6 +8659,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         applyMessageState(message);
         updateProfileSummary(getSelectedProfileName());
       } else if (message.command === 'connectionState') {
+        connectedSessionMode = message.sessionMode || '';
         setConnectState(message.state || 'idle');
       }
     });
@@ -8778,6 +8998,16 @@ function getWebviewHtml(webview: vscode.Webview): string {
         target: document.getElementById('saveTarget').value
       });
     });
+
+    const cancelOnlyButton = document.getElementById('cancelJob');
+    if (cancelOnlyButton) {
+      cancelOnlyButton.addEventListener('click', () => {
+        if (connectionState !== 'connected') {
+          return;
+        }
+        vscode.postMessage({ command: 'cancelSession' });
+      });
+    }
 
     document.getElementById('refresh').addEventListener('click', () => {
       vscode.postMessage({ command: 'ready' });

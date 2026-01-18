@@ -10,10 +10,10 @@ All notable changes to this project are documented in this file based on git tag
 - Module chips with clear-all and paste support.
 - Module paste now accepts `module load ...` lines.
 - Advanced settings reset button to restore defaults.
+- Cancel job (disconnects) button for persistent sessions.
 ### Changed
 - Clear cluster info is now a secondary action and is disabled while fetching.
 - Remote folder field no longer shows a local browse button (remote-only path).
-- SSH include status text is now shorter in the action bar.
 - SSH host and agent info hints now appear only when relevant (errors or focused field).
 - Cluster info success hints are no longer shown by default.
 - Profile summary and overrides are now grouped into a single card.
@@ -23,6 +23,8 @@ All notable changes to this project are documented in this file based on git tag
 - Dropdown menus now render above the sticky action bar.
 ### Fixed
 - Webview module parsing now escapes regex sequences correctly to avoid load errors.
+- Session/job lookups now fall back to `python` if `python3` is unavailable on the login host.
+- Cancel job now runs before disconnect; it cancels via `scancel $SLURM_JOB_ID` from an active remote session to avoid nested SSH calls.
 
 ## 0.4.3 - 2026-01-17
 ### Changed

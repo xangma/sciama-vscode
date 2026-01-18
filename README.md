@@ -28,6 +28,7 @@ The extension will query the login host, write a Slurm Connect SSH include file,
 - The **Remote folder** field expects a path on the cluster (enter manually).
 - Module selection supports chips, clear-all, and pasting multiple module names (space/newline separated), including `module load ...` lines.
 - Advanced settings include a **Reset advanced to defaults** button to restore command/SSH settings.
+- When connected to a persistent session, a **Cancel job (disconnects)** button appears to terminate the allocation (cancel is only available from an active remote session).
 
 ### SSH config hosts (optional)
 The **Login host** field can read your SSH config and list explicit `Host` entries (non-wildcard). Selecting one resolves
