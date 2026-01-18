@@ -2,6 +2,8 @@
 All notable changes to this project are documented in this file based on git tags and commit history.
 
 ## Unreleased
+
+## 0.4.4 - 2026-01-18
 ### Added
 - Sticky action bar with Connect/status and cluster info timestamp.
 - Profile summary row with derived totals and inline validation hints.
@@ -11,7 +13,7 @@ All notable changes to this project are documented in this file based on git tag
 - Module paste now accepts `module load ...` lines.
 - Advanced settings reset button to restore defaults.
 - Cancel job (disconnects) button for persistent sessions.
-- Existing session picker now shows connected client counts and idle cancel timing (based on the session's saved timeout) when no clients are connected.
+- Existing session picker now shows connected client counts (deduped per window) and idle cancel timing based on the session's saved timeout.
 ### Changed
 - Clear cluster info is now a secondary action and is disabled while fetching.
 - Remote folder field no longer shows a local browse button (remote-only path).
@@ -26,6 +28,7 @@ All notable changes to this project are documented in this file based on git tag
 - Webview module parsing now escapes regex sequences correctly to avoid load errors.
 - Session/job lookups now fall back to `python` if `python3` is unavailable on the login host.
 - Cancel job now runs before disconnect; it cancels via `scancel $SLURM_JOB_ID` from an active remote session to avoid nested SSH calls.
+- Session client counts now use active (non-stale) markers to avoid inflating counts after reconnects.
 
 ## 0.4.3 - 2026-01-17
 ### Changed
