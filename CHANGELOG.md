@@ -2,6 +2,9 @@
 All notable changes to this project are documented in this file based on git tags and commit history.
 
 ## Unreleased
+_No unreleased changes._
+
+## 0.5.0 - 2026-01-20
 ### Added
 - Pre-SSH auth command hook with an optional check command to support interactive 2FA flows before SSH queries and Remote-SSH connects.
 - Advanced setting field for additional SSH options (one per line) in the Slurm Connect view.
