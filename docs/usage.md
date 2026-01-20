@@ -33,6 +33,7 @@ This doc covers the Slurm Connect UI and workflow. For cluster discovery details
 - **Load**: Applies the selected profile values to the form.
 - **Save profile**: Saves current form values under the selected profile name (or creates a new one).
 - **Delete**: Removes the selected profile.
+Profiles include connection, resource, and advanced form values.
 
 ### Advanced settings
 - **Login hosts command (optional)**: Remote command that outputs login hosts; run over SSH to discover hosts.
@@ -46,22 +47,19 @@ This doc covers the Slurm Connect UI and workflow. For cluster discovery details
 - **Session mode**: `ephemeral` (new job per connect) or `persistent` (reuse allocation).
 - **Session key (optional)**: Identifier used to reuse a persistent session (defaults to SSH alias).
 - **Session idle timeout (seconds, 0 = never)**: Idle duration before auto-cancel in persistent mode.
-- **Session state directory (optional)**: Base directory for persistent session state.
-- **SSH host prefix**: Prefix for generated SSH host aliases (e.g., `slurm`).
-- **Slurm Connect include file path**: Path for the managed SSH include file written by the extension.
-- **SSH query config path**: SSH config file used for host discovery and query commands.
 - **Pre-SSH auth command (optional)**: Local command run before SSH queries/connect (e.g., `step ssh login`).
 - **Pre-SSH check command (optional)**: Local non-interactive check; exit 0 skips the pre-SSH auth command.
-- **Auto-install bundled proxy script on connect**: Installs/updates the bundled `vscode-proxy.py` on the login host during connect.
 - **Additional SSH options (one per line)**: Extra SSH config lines added to generated host entries.
 - **Forward agent**: Adds `ForwardAgent yes` to generated host entries.
 - **Request TTY**: Adds `RequestTTY yes` to generated host entries.
-- **Save settings to**: Writes changes to user or workspace settings.
+- **Remember values in**: Stores last-used UI values in user or workspace scope.
 - **Reset advanced to defaults**: Resets advanced fields to extension defaults.
 - **Reload saved values**: Reloads settings/cache into the UI.
 - **Open Settings**: Opens VS Code settings.
 - **Open logs**: Opens the Slurm Connect output log (capped at 5 MB; older entries are truncated).
 - **Remote-SSH log**: Opens the Remote-SSH log.
+
+Global settings such as the SSH host prefix, managed include path, session state directory, proxy auto-install, and SSH query config path live in VS Code Settings (`slurmConnect`) and are not shown in the view.
 
 ### Action bar
 - **Connect**: Creates the SSH host entry, opens Remote-SSH, and starts the allocation.

@@ -2,6 +2,10 @@
 
 All settings live under the `slurmConnect` namespace.
 
+## Profiles vs global
+- The Slurm Connect view saves its form values into profiles. Editing the UI no longer writes those values back to settings.
+- Global-only settings stay in VS Code settings and are not shown in the view: `sshHostPrefix`, `temporarySshConfigPath`, `sshQueryConfigPath`, `sessionStateDir`, `autoInstallProxyScriptOnClusterInfo`, and `sshConnectTimeoutSeconds` (plus `proxyCommand`/`proxyArgs`).
+
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
 | `slurmConnect.loginHosts` | array | `[""]` | Login hosts available for connection. Used when loginHostsCommand is empty. |

@@ -183,18 +183,20 @@ const CLUSTER_SETTING_KEYS = [
   'loginHostsQueryHost',
   'partitionCommand',
   'partitionInfoCommand',
+  'filterFreeResources',
   'qosCommand',
   'accountCommand',
   'user',
   'identityFile',
   'preSshCommand',
   'preSshCheckCommand',
+  'additionalSshOptions',
   'moduleLoad',
   'extraSallocArgs',
+  'promptForExtraSallocArgs',
   'sessionMode',
   'sessionKey',
   'sessionIdleTimeoutSeconds',
-  'sessionStateDir',
   'defaultPartition',
   'defaultNodes',
   'defaultTasksPerNode',
@@ -202,7 +204,11 @@ const CLUSTER_SETTING_KEYS = [
   'defaultTime',
   'defaultMemoryMb',
   'defaultGpuType',
-  'defaultGpuCount'
+  'defaultGpuCount',
+  'forwardAgent',
+  'requestTTY',
+  'openInNewWindow',
+  'remoteWorkspacePath'
 ] as const;
 
 type ClusterSettingKey = typeof CLUSTER_SETTING_KEYS[number];
@@ -463,7 +469,7 @@ function stripProxyOverridesFromCache(cache?: ClusterUiCache): { next: ClusterUi
   return { next, changed };
 }
 
-function stripProxyOverridesFromProfile(values: UiValues): { next: UiValues; changed: boolean } {
+function stripProxyOverridesFromProfile(values: ProfileValues): { next: ProfileValues; changed: boolean } {
   const next = { ...values };
   let changed = false;
   if (Object.prototype.hasOwnProperty.call(next, 'proxyCommand')) {
@@ -474,10 +480,10 @@ function stripProxyOverridesFromProfile(values: UiValues): { next: UiValues; cha
     delete (next as Partial<UiValues>).proxyArgs;
     changed = true;
   }
-  return { next: next as UiValues, changed };
+  return { next: next as ProfileValues, changed };
 }
 
-function sanitizeProfileModuleCommands(values: UiValues): { next: UiValues; changed: boolean } {
+function sanitizeProfileModuleCommands(values: ProfileValues): { next: ProfileValues; changed: boolean } {
   let changed = false;
   const next = { ...values };
   const selections = normalizeModuleSelections(next.moduleSelections);
@@ -506,7 +512,7 @@ function sanitizeProfileModuleCommands(values: UiValues): { next: UiValues; chan
     changed = true;
   }
 
-  return { next, changed };
+  return { next: next as ProfileValues, changed };
 }
 
 async function migrateLegacyModuleCommands(): Promise<void> {
@@ -530,8 +536,9 @@ async function migrateLegacyModuleCommands(): Promise<void> {
     const store = getProfileStore();
     let changed = false;
     for (const [key, profile] of Object.entries(store)) {
-      const sanitized = sanitizeProfileModuleCommands(profile.values);
-      if (sanitized.changed) {
+      const filtered = filterProfileValues(profile.values as Partial<UiValues>);
+      const sanitized = sanitizeProfileModuleCommands(filtered.next);
+      if (filtered.changed || sanitized.changed) {
         store[key] = {
           ...profile,
           values: sanitized.next,
@@ -604,7 +611,7 @@ async function resetProxyOverridesToDefaults(): Promise<void> {
   }
 }
 
-function mapConfigValueToUi(key: ClusterSettingKey, value: unknown): string {
+function mapConfigValueToUi(key: ClusterSettingKey, value: unknown): UiValues[ClusterSettingKey] {
   switch (key) {
     case 'loginHosts':
     case 'extraSallocArgs': {
@@ -634,6 +641,18 @@ function mapConfigValueToUi(key: ClusterSettingKey, value: unknown): string {
       }
       return String(Math.floor(numeric));
     }
+    case 'filterFreeResources':
+    case 'promptForExtraSallocArgs':
+    case 'forwardAgent':
+    case 'requestTTY':
+    case 'openInNewWindow':
+      return Boolean(value) as UiValues[ClusterSettingKey];
+    case 'additionalSshOptions': {
+      if (value && typeof value === 'object') {
+        return formatAdditionalSshOptions(value as Record<string, string>) as UiValues[ClusterSettingKey];
+      }
+      return value === undefined || value === null ? '' : String(value);
+    }
     default:
       return value === undefined || value === null ? '' : String(value);
   }
@@ -660,14 +679,20 @@ async function migrateClusterSettingsToCache(): Promise<void> {
     const inspect = cfg.inspect(key);
     if (inspect?.globalValue !== undefined) {
       if (!Object.prototype.hasOwnProperty.call(nextGlobalCache, key)) {
-        nextGlobalCache[key] = mapConfigValueToUi(key, inspect.globalValue);
+        (nextGlobalCache as Record<ClusterSettingKey, UiValues[ClusterSettingKey]>)[key] = mapConfigValueToUi(
+          key,
+          inspect.globalValue
+        );
         updatedGlobal = true;
       }
       globalKeysToClear.add(key);
     }
     if (inspect?.workspaceValue !== undefined) {
       if (!Object.prototype.hasOwnProperty.call(nextWorkspaceCache, key)) {
-        nextWorkspaceCache[key] = mapConfigValueToUi(key, inspect.workspaceValue);
+        (nextWorkspaceCache as Record<ClusterSettingKey, UiValues[ClusterSettingKey]>)[key] = mapConfigValueToUi(
+          key,
+          inspect.workspaceValue
+        );
         updatedWorkspace = true;
       }
       workspaceKeysToClear.add(key);
@@ -689,7 +714,8 @@ async function migrateClusterSettingsToCache(): Promise<void> {
         if (unique.size === 1) {
           if (inspect?.workspaceValue === undefined) {
             if (!Object.prototype.hasOwnProperty.call(nextWorkspaceCache, key)) {
-              nextWorkspaceCache[key] = mapConfigValueToUi(key, folderValues[0].value);
+              (nextWorkspaceCache as Record<ClusterSettingKey, UiValues[ClusterSettingKey]>)[key] =
+                mapConfigValueToUi(key, folderValues[0].value);
               updatedWorkspace = true;
             }
           }
@@ -912,14 +938,13 @@ interface UiValues {
   remoteWorkspacePath: string;
 }
 
-type ClusterUiCache = Partial<UiValues>;
-
-const CLUSTER_UI_KEYS = new Set<keyof UiValues>([
+const PROFILE_UI_KEYS = [
   'loginHosts',
   'loginHostsCommand',
   'loginHostsQueryHost',
   'partitionCommand',
   'partitionInfoCommand',
+  'filterFreeResources',
   'qosCommand',
   'accountCommand',
   'user',
@@ -931,10 +956,10 @@ const CLUSTER_UI_KEYS = new Set<keyof UiValues>([
   'moduleSelections',
   'moduleCustomCommand',
   'extraSallocArgs',
+  'promptForExtraSallocArgs',
   'sessionMode',
   'sessionKey',
   'sessionIdleTimeoutSeconds',
-  'sessionStateDir',
   'defaultPartition',
   'defaultNodes',
   'defaultTasksPerNode',
@@ -942,12 +967,22 @@ const CLUSTER_UI_KEYS = new Set<keyof UiValues>([
   'defaultTime',
   'defaultMemoryMb',
   'defaultGpuType',
-  'defaultGpuCount'
-]);
+  'defaultGpuCount',
+  'forwardAgent',
+  'requestTTY',
+  'openInNewWindow',
+  'remoteWorkspacePath'
+] as const;
+
+type ProfileUiKey = typeof PROFILE_UI_KEYS[number];
+type ProfileValues = { [K in ProfileUiKey]?: UiValues[K] };
+type ClusterUiCache = Partial<UiValues>;
+
+const PROFILE_UI_KEY_SET = new Set<keyof UiValues>(PROFILE_UI_KEYS);
 
 interface ProfileEntry {
   name: string;
-  values: UiValues;
+  values: ProfileValues;
   createdAt: string;
   updatedAt: string;
 }
@@ -1093,26 +1128,39 @@ function syncConnectionStateFromEnvironment(): void {
   }
 }
 
-function mergeUiValuesWithDefaults(values?: Partial<UiValues>): UiValues {
-  const defaults = getUiValuesFromStorage();
+function mergeUiValuesWithDefaults(values?: Partial<UiValues>, defaults?: UiValues): UiValues {
+  const base = defaults ?? getUiValuesFromStorage();
   if (!values) {
-    return defaults;
+    return base;
   }
   return {
-    ...defaults,
+    ...base,
     ...values
   } as UiValues;
 }
 
-function pickClusterUiValues(values: UiValues): ClusterUiCache {
-  const picked: ClusterUiCache = {};
-  for (const key of CLUSTER_UI_KEYS) {
-    const value = values[key];
-    if (value !== undefined) {
-      (picked as Record<keyof UiValues, UiValues[keyof UiValues]>)[key] = value;
+function pickProfileValues(values: Partial<UiValues>): ProfileValues {
+  const picked: ProfileValues = {};
+  const target = picked as Record<ProfileUiKey, UiValues[ProfileUiKey]>;
+  for (const key of PROFILE_UI_KEY_SET) {
+    if (Object.prototype.hasOwnProperty.call(values, key)) {
+      target[key as ProfileUiKey] = values[key] as UiValues[ProfileUiKey];
     }
   }
   return picked;
+}
+
+function filterProfileValues(values: Partial<UiValues>): { next: ProfileValues; changed: boolean } {
+  const next: ProfileValues = {};
+  let changed = false;
+  for (const [key, value] of Object.entries(values)) {
+    if (PROFILE_UI_KEY_SET.has(key as keyof UiValues)) {
+      (next as Record<string, unknown>)[key] = value;
+    } else {
+      changed = true;
+    }
+  }
+  return { next, changed };
 }
 
 function getClusterUiCache(state?: vscode.Memento): ClusterUiCache | undefined {
@@ -1141,7 +1189,7 @@ function resolvePreferredSaveTarget(): 'global' | 'workspace' {
   return 'global';
 }
 
-async function updateClusterUiCache(values: UiValues, target: vscode.ConfigurationTarget): Promise<void> {
+async function updateClusterUiCache(values: ProfileValues, target: vscode.ConfigurationTarget): Promise<void> {
   const hasWorkspace = Boolean(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0);
   const useWorkspace =
     hasWorkspace &&
@@ -1150,7 +1198,7 @@ async function updateClusterUiCache(values: UiValues, target: vscode.Configurati
   if (!state) {
     return;
   }
-  await state.update(CLUSTER_UI_CACHE_KEY, pickClusterUiValues(values));
+  await state.update(CLUSTER_UI_CACHE_KEY, pickProfileValues(values));
 }
 
 function getProfileStore(): ProfileStore {
@@ -1183,7 +1231,11 @@ function getProfileSummaries(store: ProfileStore): ProfileSummary[] {
 
 function getProfileValues(name: string): UiValues | undefined {
   const store = getProfileStore();
-  return store[name]?.values;
+  const entry = store[name];
+  if (!entry) {
+    return undefined;
+  }
+  return mergeUiValuesWithDefaults(pickProfileValues(entry.values), getUiGlobalDefaults());
 }
 
 function normalizeWhitespace(value: string | undefined | null): string {
@@ -1245,9 +1297,6 @@ function buildProfileOverrides(values: UiValues, defaults: UiValues): ProfileOve
   if (diffString(values.additionalSshOptions, defaults.additionalSshOptions)) {
     add('Additional SSH options', values.additionalSshOptions);
   }
-  if (diffBool(values.autoInstallProxyScriptOnClusterInfo, defaults.autoInstallProxyScriptOnClusterInfo)) {
-    add('Auto-install proxy on connect', values.autoInstallProxyScriptOnClusterInfo ? 'Yes' : 'No');
-  }
   if (diffString(values.remoteWorkspacePath, defaults.remoteWorkspacePath)) {
     add('Remote folder', values.remoteWorkspacePath);
   }
@@ -1282,9 +1331,6 @@ function buildProfileOverrides(values: UiValues, defaults: UiValues): ProfileOve
   if (diffString(values.sessionIdleTimeoutSeconds, defaults.sessionIdleTimeoutSeconds)) {
     add('Session idle timeout', values.sessionIdleTimeoutSeconds + 's');
   }
-  if (diffString(values.sessionStateDir, defaults.sessionStateDir)) {
-    add('Session state dir', values.sessionStateDir);
-  }
 
   if (diffString(values.loginHostsCommand, defaults.loginHostsCommand)) {
     add('Login hosts command', values.loginHostsCommand);
@@ -1301,13 +1347,6 @@ function buildProfileOverrides(values: UiValues, defaults: UiValues): ProfileOve
   if (diffString(values.qosCommand, defaults.qosCommand)) add('QoS command', values.qosCommand);
   if (diffString(values.accountCommand, defaults.accountCommand)) add('Account command', values.accountCommand);
 
-  if (diffString(values.sshHostPrefix, defaults.sshHostPrefix)) add('SSH host prefix', values.sshHostPrefix);
-  if (diffString(values.temporarySshConfigPath, defaults.temporarySshConfigPath)) {
-    add('Slurm Connect include path', values.temporarySshConfigPath);
-  }
-  if (diffString(values.sshQueryConfigPath, defaults.sshQueryConfigPath)) {
-    add('SSH query config', values.sshQueryConfigPath);
-  }
   if (diffBool(values.forwardAgent, defaults.forwardAgent)) {
     add('Forward agent', values.forwardAgent ? 'Enabled' : 'Disabled');
   }
@@ -1365,7 +1404,8 @@ function buildProfileSummaryMap(
 ): Record<string, ProfileResourceSummary> {
   const summaries: Record<string, ProfileResourceSummary> = {};
   Object.entries(store).forEach(([name, entry]) => {
-    summaries[name] = buildProfileResourceSummary(entry.values, defaults);
+    const merged = mergeUiValuesWithDefaults(pickProfileValues(entry.values), defaults);
+    summaries[name] = buildProfileResourceSummary(merged, defaults);
   });
   return summaries;
 }
@@ -1519,22 +1559,22 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           syncConnectionStateFromEnvironment();
           let activeProfile = getActiveProfileName();
           const defaults = getUiValuesFromStorage();
-          const values = defaults;
+          const values = pickProfileValues(defaults);
           if (activeProfile && !getProfileValues(activeProfile)) {
             activeProfile = undefined;
           }
-          const agentStatus = await buildAgentStatusMessage(values.identityFile);
-          const host = firstLoginHostFromInput(values.loginHosts);
+          const agentStatus = await buildAgentStatusMessage(defaults.identityFile);
+          const host = firstLoginHostFromInput(defaults.loginHosts);
           const cached = host ? getCachedClusterInfo(host) : undefined;
           webview.postMessage({
             command: 'load',
             values,
-            defaults: getUiDefaultsFromConfig(),
+            defaults: pickProfileValues(getUiDefaultsFromConfig()),
             clusterInfo: cached?.info,
             clusterInfoCachedAt: cached?.fetchedAt,
             sessions: [],
             profiles: getProfileSummaries(getProfileStore()),
-            profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiDefaultsFromConfig()),
+            profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiGlobalDefaults()),
             activeProfile,
             connectionState,
             connectionSessionMode: lastConnectionSessionMode,
@@ -1550,7 +1590,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           const target = message.target === 'workspace'
             ? vscode.ConfigurationTarget.Workspace
             : vscode.ConfigurationTarget.Global;
-          const uiValues = message.values as UiValues;
+          const uiValues = message.values as ProfileValues;
           const sessionSelection =
             typeof message.sessionSelection === 'string' ? message.sessionSelection.trim() : '';
           await updateConfigFromUi(uiValues, target);
@@ -1571,7 +1611,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           const target = message.target === 'workspace'
             ? vscode.ConfigurationTarget.Workspace
             : vscode.ConfigurationTarget.Global;
-          const uiValues = message.values as UiValues;
+          const uiValues = message.values as ProfileValues;
           await updateConfigFromUi(uiValues, target);
           break;
         }
@@ -1580,7 +1620,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           if (!host) {
             break;
           }
-          const uiValues = message.values as UiValues | undefined;
+          const uiValues = message.values as ProfileValues | undefined;
           const overrides = uiValues ? buildOverridesFromUi(uiValues) : undefined;
           try {
             const cfg = getConfigWithOverrides(overrides);
@@ -1668,7 +1708,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'saveProfile': {
-          const uiValues = message.values as UiValues;
+          const uiValues = message.values as ProfileValues;
           const suggestedRaw = typeof message.suggestedName === 'string' ? message.suggestedName : '';
           const suggestedName = suggestedRaw.trim();
           const nameInput = await vscode.window.showInputBox({
@@ -1680,7 +1720,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(getProfileStore()),
-              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiDefaultsFromConfig()),
+              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiGlobalDefaults()),
               activeProfile: getActiveProfileName(),
               profileStatus: 'Profile save cancelled.'
             });
@@ -1691,7 +1731,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(getProfileStore()),
-              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiDefaultsFromConfig()),
+              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiGlobalDefaults()),
               activeProfile: getActiveProfileName(),
               profileStatus: 'Enter a profile name before saving.',
               profileError: true
@@ -1703,7 +1743,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           const now = new Date().toISOString();
           store[name] = {
             name,
-            values: uiValues,
+            values: pickProfileValues(uiValues),
             createdAt: existing?.createdAt ?? now,
             updatedAt: now
           };
@@ -1714,7 +1754,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           webview.postMessage({
             command: 'profiles',
             profiles: getProfileSummaries(store),
-            profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
+            profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
             activeProfile: name,
             profileStatus: existing ? `Profile "${name}" updated.` : `Profile "${name}" saved.`
           });
@@ -1727,7 +1767,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(getProfileStore()),
-              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiDefaultsFromConfig()),
+              profileSummaries: buildProfileSummaryMap(getProfileStore(), getUiGlobalDefaults()),
               activeProfile: getActiveProfileName(),
               profileStatus: 'Select a profile to load.',
               profileError: true
@@ -1740,7 +1780,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(store),
-              profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
+              profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
               activeProfile: getActiveProfileName(),
               profileStatus: `Profile "${name}" not found.`,
               profileError: true
@@ -1749,15 +1789,27 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           }
           await setActiveProfileName(name);
           syncConnectionStateFromEnvironment();
-          const host = firstLoginHostFromInput(profile.values.loginHosts);
+          const resolved = getProfileValues(name);
+          if (!resolved) {
+            webview.postMessage({
+              command: 'profiles',
+              profiles: getProfileSummaries(store),
+              profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
+              activeProfile: getActiveProfileName(),
+              profileStatus: `Profile "${name}" not found.`,
+              profileError: true
+            });
+            break;
+          }
+          const host = firstLoginHostFromInput(resolved.loginHosts);
           const cached = host ? getCachedClusterInfo(host) : undefined;
           webview.postMessage({
             command: 'load',
-            values: profile.values,
+            values: pickProfileValues(resolved),
             clusterInfo: cached?.info,
             clusterInfoCachedAt: cached?.fetchedAt,
             profiles: getProfileSummaries(store),
-            profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
+            profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
             activeProfile: name,
             connectionState,
             remoteActive: vscode.env.remoteName === 'ssh-remote',
@@ -1774,7 +1826,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(store),
-              profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
+              profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
               activeProfile: getActiveProfileName(),
               profileStatus: 'Select a profile to delete.',
               profileError: true
@@ -1790,7 +1842,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             webview.postMessage({
               command: 'profiles',
               profiles: getProfileSummaries(store),
-              profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
+              profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
               activeProfile: getActiveProfileName(),
               profileStatus: 'Profile deletion cancelled.'
             });
@@ -1808,14 +1860,14 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           webview.postMessage({
             command: 'profiles',
             profiles: getProfileSummaries(store),
-            profileSummaries: buildProfileSummaryMap(store, getUiDefaultsFromConfig()),
+            profileSummaries: buildProfileSummaryMap(store, getUiGlobalDefaults()),
             activeProfile,
             profileStatus: `Profile "${name}" deleted.`
           });
           break;
         }
         case 'getClusterInfo': {
-          const uiValues = message.values as UiValues;
+          const uiValues = message.values as ProfileValues;
           await handleClusterInfoRequest(uiValues, webview);
           break;
         }
@@ -2563,14 +2615,14 @@ function applySessionIdleInfo(sessions: SessionSummary[]): SessionSummary[] {
   });
 }
 
-async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webview): Promise<void> {
+async function handleClusterInfoRequest(values: ProfileValues, webview: vscode.Webview): Promise<void> {
   if (clusterInfoRequestInFlight) {
     return;
   }
   clusterInfoRequestInFlight = true;
   const overrides = buildOverridesFromUi(values);
   const cfg = getConfigWithOverrides(overrides);
-  const loginHosts = parseListInput(values.loginHosts);
+  const loginHosts = parseListInput(String(values.loginHosts ?? ''));
   const log = getOutputChannel();
   let sessions: SessionSummary[] = [];
 
@@ -2578,7 +2630,7 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
     if (loginHosts.length === 0) {
       const message = 'Enter a login host before fetching cluster info.';
       void vscode.window.showErrorMessage(message);
-      const agentStatus = await buildAgentStatusMessage(values.identityFile);
+      const agentStatus = await buildAgentStatusMessage(String(values.identityFile ?? ''));
       webview.postMessage({
         command: 'clusterInfoError',
         message,
@@ -2594,7 +2646,7 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
     const proceed = await maybePromptForSshAuthOnConnect(cfg, loginHost);
     if (!proceed) {
       const message = 'Set an SSH identity file in the Slurm Connect view, then retry.';
-      const agentStatus = await buildAgentStatusMessage(values.identityFile);
+      const agentStatus = await buildAgentStatusMessage(String(values.identityFile ?? ''));
       webview.postMessage({
         command: 'clusterInfoError',
         message,
@@ -2616,7 +2668,7 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
     }
     cacheClusterInfo(loginHost, info);
     const cached = getCachedClusterInfo(loginHost);
-    const agentStatus = await buildAgentStatusMessage(values.identityFile);
+    const agentStatus = await buildAgentStatusMessage(String(values.identityFile ?? ''));
     webview.postMessage({
       command: 'clusterInfo',
       info,
@@ -2628,7 +2680,7 @@ async function handleClusterInfoRequest(values: UiValues, webview: vscode.Webvie
   } catch (error) {
     const message = formatError(error);
     void vscode.window.showErrorMessage(`Failed to fetch cluster info: ${message}`);
-    const agentStatus = await buildAgentStatusMessage(values.identityFile);
+    const agentStatus = await buildAgentStatusMessage(String(values.identityFile ?? ''));
     webview.postMessage({
       command: 'clusterInfoError',
       message,
@@ -5855,6 +5907,10 @@ function getUiValuesFromStorage(): UiValues {
   return getUiValuesFromConfig(getConfigFromSettings(), getMergedClusterUiCache());
 }
 
+function getUiGlobalDefaults(): UiValues {
+  return getUiValuesFromConfig(getConfigFromSettings());
+}
+
 function getUiDefaultsFromConfig(): UiValues {
   return getUiValuesFromConfig(getConfigDefaultsFromSettings());
 }
@@ -5892,7 +5948,7 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     loginHostsQueryHost: fromCache('loginHostsQueryHost', cfg.loginHostsQueryHost || ''),
     partitionCommand: fromCache('partitionCommand', cfg.partitionCommand || ''),
     partitionInfoCommand: fromCache('partitionInfoCommand', cfg.partitionInfoCommand || ''),
-    filterFreeResources: cfg.filterFreeResources,
+    filterFreeResources: fromCache('filterFreeResources', cfg.filterFreeResources),
     qosCommand: fromCache('qosCommand', cfg.qosCommand || ''),
     accountCommand: fromCache('accountCommand', cfg.accountCommand || ''),
     user: fromCache('user', cfg.user || ''),
@@ -5900,21 +5956,21 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     preSshCommand: fromCache('preSshCommand', cfg.preSshCommand || ''),
     preSshCheckCommand: fromCache('preSshCheckCommand', cfg.preSshCheckCommand || ''),
     autoInstallProxyScriptOnClusterInfo: cfg.autoInstallProxyScriptOnClusterInfo,
-    additionalSshOptions: formatAdditionalSshOptions(cfg.additionalSshOptions),
+    additionalSshOptions: fromCache('additionalSshOptions', formatAdditionalSshOptions(cfg.additionalSshOptions)),
     moduleLoad: fromCache('moduleLoad', cfg.moduleLoad || ''),
     moduleSelections: getCachedUiValue(cache, 'moduleSelections'),
     moduleCustomCommand: getCachedUiValue(cache, 'moduleCustomCommand'),
     proxyCommand: fromCache('proxyCommand', cfg.proxyCommand || ''),
     proxyArgs: fromCache('proxyArgs', cfg.proxyArgs.join('\n')),
     extraSallocArgs: fromCache('extraSallocArgs', cfg.extraSallocArgs.join('\n')),
-    promptForExtraSallocArgs: cfg.promptForExtraSallocArgs,
+    promptForExtraSallocArgs: fromCache('promptForExtraSallocArgs', cfg.promptForExtraSallocArgs),
     sessionMode: fromCache('sessionMode', cfg.sessionMode || 'persistent'),
     sessionKey: fromCache('sessionKey', cfg.sessionKey || ''),
     sessionIdleTimeoutSeconds: fromCache(
       'sessionIdleTimeoutSeconds',
       String(cfg.sessionIdleTimeoutSeconds ?? 600)
     ),
-    sessionStateDir: fromCache('sessionStateDir', cfg.sessionStateDir || ''),
+    sessionStateDir: cfg.sessionStateDir || '',
     defaultPartition: hasDefaultPartition ? fromCache('defaultPartition', cfg.defaultPartition || '') : '',
     defaultNodes: hasDefaultNodes ? fromCache('defaultNodes', String(cfg.defaultNodes || '')) : '',
     defaultTasksPerNode: hasDefaultTasksPerNode
@@ -5928,40 +5984,16 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     defaultGpuType: hasDefaultGpuType ? fromCache('defaultGpuType', cfg.defaultGpuType || '') : '',
     defaultGpuCount: hasDefaultGpuCount ? fromCache('defaultGpuCount', String(cfg.defaultGpuCount || '')) : '',
     sshHostPrefix: cfg.sshHostPrefix || '',
-    forwardAgent: cfg.forwardAgent,
-    requestTTY: cfg.requestTTY,
-    openInNewWindow: cfg.openInNewWindow,
-    remoteWorkspacePath: cfg.remoteWorkspacePath || '',
+    forwardAgent: fromCache('forwardAgent', cfg.forwardAgent),
+    requestTTY: fromCache('requestTTY', cfg.requestTTY),
+    openInNewWindow: fromCache('openInNewWindow', cfg.openInNewWindow),
+    remoteWorkspacePath: fromCache('remoteWorkspacePath', cfg.remoteWorkspacePath || ''),
     temporarySshConfigPath: cfg.temporarySshConfigPath || '',
     sshQueryConfigPath: cfg.sshQueryConfigPath || ''
   };
 }
 
-async function updateConfigFromUi(values: UiValues, target: vscode.ConfigurationTarget): Promise<void> {
-  const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
-
-  const updates: Array<[string, unknown]> = [
-    ['promptForExtraSallocArgs', Boolean(values.promptForExtraSallocArgs)],
-    ['sessionMode', normalizeSessionMode(values.sessionMode)],
-    ['sessionKey', values.sessionKey.trim()],
-    ['sessionIdleTimeoutSeconds', parseNonNegativeNumberInput(values.sessionIdleTimeoutSeconds)],
-    ['sessionStateDir', values.sessionStateDir.trim()],
-    ['filterFreeResources', Boolean(values.filterFreeResources)],
-    ['autoInstallProxyScriptOnClusterInfo', Boolean(values.autoInstallProxyScriptOnClusterInfo)],
-    ['sshHostPrefix', values.sshHostPrefix.trim()],
-    ['additionalSshOptions', parseAdditionalSshOptionsInput(values.additionalSshOptions)],
-    ['forwardAgent', Boolean(values.forwardAgent)],
-    ['requestTTY', Boolean(values.requestTTY)],
-    ['openInNewWindow', Boolean(values.openInNewWindow)],
-    ['remoteWorkspacePath', values.remoteWorkspacePath.trim()],
-    ['temporarySshConfigPath', values.temporarySshConfigPath.trim()],
-    ['sshQueryConfigPath', values.sshQueryConfigPath.trim()]
-  ];
-
-  for (const [key, value] of updates) {
-    await cfg.update(key, value, target);
-  }
-
+async function updateConfigFromUi(values: ProfileValues, target: vscode.ConfigurationTarget): Promise<void> {
   await updateClusterUiCache(values, target);
 }
 
@@ -5974,12 +6006,16 @@ function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConne
   if (has('loginHostsQueryHost')) overrides.loginHostsQueryHost = String(values.loginHostsQueryHost ?? '').trim();
   if (has('partitionCommand')) overrides.partitionCommand = String(values.partitionCommand ?? '').trim();
   if (has('partitionInfoCommand')) overrides.partitionInfoCommand = String(values.partitionInfoCommand ?? '').trim();
+  if (has('filterFreeResources')) overrides.filterFreeResources = Boolean(values.filterFreeResources);
   if (has('qosCommand')) overrides.qosCommand = String(values.qosCommand ?? '').trim();
   if (has('accountCommand')) overrides.accountCommand = String(values.accountCommand ?? '').trim();
   if (has('user')) overrides.user = String(values.user ?? '').trim();
   if (has('identityFile')) overrides.identityFile = String(values.identityFile ?? '').trim();
   if (has('preSshCommand')) overrides.preSshCommand = String(values.preSshCommand ?? '').trim();
   if (has('preSshCheckCommand')) overrides.preSshCheckCommand = String(values.preSshCheckCommand ?? '').trim();
+  if (has('additionalSshOptions')) {
+    overrides.additionalSshOptions = parseAdditionalSshOptionsInput(String(values.additionalSshOptions ?? ''));
+  }
   if (has('moduleLoad')) {
     overrides.moduleLoad = String(values.moduleLoad ?? '').trim();
   } else {
@@ -5992,12 +6028,14 @@ function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConne
     }
   }
   if (has('extraSallocArgs')) overrides.extraSallocArgs = splitShellArgs(String(values.extraSallocArgs ?? ''));
+  if (has('promptForExtraSallocArgs')) {
+    overrides.promptForExtraSallocArgs = Boolean(values.promptForExtraSallocArgs);
+  }
   if (has('sessionMode')) overrides.sessionMode = normalizeSessionMode(String(values.sessionMode ?? ''));
   if (has('sessionKey')) overrides.sessionKey = String(values.sessionKey ?? '').trim();
   if (has('sessionIdleTimeoutSeconds')) {
     overrides.sessionIdleTimeoutSeconds = parseNonNegativeNumberInput(String(values.sessionIdleTimeoutSeconds ?? ''));
   }
-  if (has('sessionStateDir')) overrides.sessionStateDir = String(values.sessionStateDir ?? '').trim();
   if (has('defaultPartition')) overrides.defaultPartition = String(values.defaultPartition ?? '').trim();
   if (has('defaultNodes')) overrides.defaultNodes = parsePositiveNumberInput(String(values.defaultNodes ?? ''));
   if (has('defaultTasksPerNode')) {
@@ -6010,6 +6048,10 @@ function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConne
   if (has('defaultMemoryMb')) overrides.defaultMemoryMb = parseNonNegativeNumberInput(String(values.defaultMemoryMb ?? ''));
   if (has('defaultGpuType')) overrides.defaultGpuType = String(values.defaultGpuType ?? '').trim();
   if (has('defaultGpuCount')) overrides.defaultGpuCount = parseNonNegativeNumberInput(String(values.defaultGpuCount ?? ''));
+  if (has('forwardAgent')) overrides.forwardAgent = Boolean(values.forwardAgent);
+  if (has('requestTTY')) overrides.requestTTY = Boolean(values.requestTTY);
+  if (has('openInNewWindow')) overrides.openInNewWindow = Boolean(values.openInNewWindow);
+  if (has('remoteWorkspacePath')) overrides.remoteWorkspacePath = String(values.remoteWorkspacePath ?? '').trim();
 
   return overrides;
 }
@@ -6287,49 +6329,44 @@ function normalizeSessionMode(value: string): SessionMode {
   return value === 'persistent' ? 'persistent' : 'ephemeral';
 }
 
-function buildOverridesFromUi(values: UiValues): Partial<SlurmConnectConfig> {
-  const moduleLoad = values.moduleLoad.trim();
+function buildOverridesFromUi(values: ProfileValues): Partial<SlurmConnectConfig> {
+  const moduleLoad = String(values.moduleLoad ?? '').trim();
   const moduleCustom = normalizeModuleCustomCommand(values.moduleCustomCommand);
   const moduleSelections = normalizeModuleSelections(values.moduleSelections);
   const resolvedModuleLoad =
     moduleLoad || moduleCustom || (moduleSelections.length > 0 ? `module load ${moduleSelections.join(' ')}` : '');
   return {
-    loginHosts: parseListInput(values.loginHosts),
-    loginHostsCommand: values.loginHostsCommand.trim(),
-    loginHostsQueryHost: values.loginHostsQueryHost.trim(),
-    partitionCommand: values.partitionCommand.trim(),
-    partitionInfoCommand: values.partitionInfoCommand.trim(),
+    loginHosts: parseListInput(String(values.loginHosts ?? '')),
+    loginHostsCommand: String(values.loginHostsCommand ?? '').trim(),
+    loginHostsQueryHost: String(values.loginHostsQueryHost ?? '').trim(),
+    partitionCommand: String(values.partitionCommand ?? '').trim(),
+    partitionInfoCommand: String(values.partitionInfoCommand ?? '').trim(),
     filterFreeResources: Boolean(values.filterFreeResources),
-    qosCommand: values.qosCommand.trim(),
-    accountCommand: values.accountCommand.trim(),
-    user: values.user.trim(),
-    identityFile: values.identityFile.trim(),
-    preSshCommand: values.preSshCommand.trim(),
-    preSshCheckCommand: values.preSshCheckCommand.trim(),
-    autoInstallProxyScriptOnClusterInfo: Boolean(values.autoInstallProxyScriptOnClusterInfo),
-    additionalSshOptions: parseAdditionalSshOptionsInput(values.additionalSshOptions),
+    qosCommand: String(values.qosCommand ?? '').trim(),
+    accountCommand: String(values.accountCommand ?? '').trim(),
+    user: String(values.user ?? '').trim(),
+    identityFile: String(values.identityFile ?? '').trim(),
+    preSshCommand: String(values.preSshCommand ?? '').trim(),
+    preSshCheckCommand: String(values.preSshCheckCommand ?? '').trim(),
+    additionalSshOptions: parseAdditionalSshOptionsInput(String(values.additionalSshOptions ?? '')),
     moduleLoad: resolvedModuleLoad,
-    extraSallocArgs: splitShellArgs(values.extraSallocArgs),
+    extraSallocArgs: splitShellArgs(String(values.extraSallocArgs ?? '')),
     promptForExtraSallocArgs: Boolean(values.promptForExtraSallocArgs),
-    sessionMode: normalizeSessionMode(values.sessionMode),
-    sessionKey: values.sessionKey.trim(),
-    sessionIdleTimeoutSeconds: parseNonNegativeNumberInput(values.sessionIdleTimeoutSeconds),
-    sessionStateDir: values.sessionStateDir.trim(),
-    defaultPartition: values.defaultPartition.trim(),
-    defaultNodes: parsePositiveNumberInput(values.defaultNodes),
-    defaultTasksPerNode: parsePositiveNumberInput(values.defaultTasksPerNode),
-    defaultCpusPerTask: parsePositiveNumberInput(values.defaultCpusPerTask),
-    defaultTime: values.defaultTime.trim(),
-    defaultMemoryMb: parseNonNegativeNumberInput(values.defaultMemoryMb),
-    defaultGpuType: values.defaultGpuType.trim(),
-    defaultGpuCount: parseNonNegativeNumberInput(values.defaultGpuCount),
-    sshHostPrefix: values.sshHostPrefix.trim(),
+    sessionMode: normalizeSessionMode(String(values.sessionMode ?? '')),
+    sessionKey: String(values.sessionKey ?? '').trim(),
+    sessionIdleTimeoutSeconds: parseNonNegativeNumberInput(String(values.sessionIdleTimeoutSeconds ?? '')),
+    defaultPartition: String(values.defaultPartition ?? '').trim(),
+    defaultNodes: parsePositiveNumberInput(String(values.defaultNodes ?? '')),
+    defaultTasksPerNode: parsePositiveNumberInput(String(values.defaultTasksPerNode ?? '')),
+    defaultCpusPerTask: parsePositiveNumberInput(String(values.defaultCpusPerTask ?? '')),
+    defaultTime: String(values.defaultTime ?? '').trim(),
+    defaultMemoryMb: parseNonNegativeNumberInput(String(values.defaultMemoryMb ?? '')),
+    defaultGpuType: String(values.defaultGpuType ?? '').trim(),
+    defaultGpuCount: parseNonNegativeNumberInput(String(values.defaultGpuCount ?? '')),
     forwardAgent: Boolean(values.forwardAgent),
     requestTTY: Boolean(values.requestTTY),
     openInNewWindow: Boolean(values.openInNewWindow),
-    remoteWorkspacePath: values.remoteWorkspacePath.trim(),
-    temporarySshConfigPath: values.temporarySshConfigPath.trim(),
-    sshQueryConfigPath: values.sshQueryConfigPath.trim()
+    remoteWorkspacePath: String(values.remoteWorkspacePath ?? '').trim()
   };
 }
 
@@ -6869,22 +6906,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <input id="sessionKey" type="text" placeholder="Defaults to SSH alias" />
     <label for="sessionIdleTimeoutSeconds">Session idle timeout (seconds, 0 = never)</label>
     <input id="sessionIdleTimeoutSeconds" type="number" min="0" placeholder="600" />
-    <label for="sessionStateDir">Session state directory (optional)</label>
-    <input id="sessionStateDir" type="text" placeholder="~/.slurm-connect" />
-    <label for="sshHostPrefix">SSH host prefix</label>
-    <input id="sshHostPrefix" type="text" />
-    <label for="temporarySshConfigPath">Slurm Connect include file path</label>
-    <input id="temporarySshConfigPath" type="text" />
-    <label for="sshQueryConfigPath">SSH query config path</label>
-    <input id="sshQueryConfigPath" type="text" />
     <label for="preSshCommand">Pre-SSH auth command (optional)</label>
     <input id="preSshCommand" type="text" placeholder="" />
     <label for="preSshCheckCommand">Pre-SSH check command (optional)</label>
     <input id="preSshCheckCommand" type="text" placeholder="" />
-    <div class="checkbox">
-      <input id="autoInstallProxyScriptOnClusterInfo" type="checkbox" />
-      <label for="autoInstallProxyScriptOnClusterInfo">Auto-install bundled proxy script on connect</label>
-    </div>
     <label for="additionalSshOptions">Additional SSH options (one per line)</label>
     <textarea id="additionalSshOptions" rows="3" placeholder=""></textarea>
     <div class="checkbox">
@@ -6895,7 +6920,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <input id="requestTTY" type="checkbox" />
       <label for="requestTTY">Request TTY</label>
     </div>
-    <label for="saveTarget">Save settings to</label>
+    <label for="saveTarget">Remember values in</label>
     <select id="saveTarget">
       <option value="global">User settings</option>
       <option value="workspace">Workspace settings</option>
@@ -7119,14 +7144,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
       set('sessionMode', defaults.sessionMode);
       set('sessionKey', defaults.sessionKey);
       set('sessionIdleTimeoutSeconds', defaults.sessionIdleTimeoutSeconds);
-      set('sessionStateDir', defaults.sessionStateDir);
       set('preSshCommand', defaults.preSshCommand);
       set('preSshCheckCommand', defaults.preSshCheckCommand);
-      set('autoInstallProxyScriptOnClusterInfo', defaults.autoInstallProxyScriptOnClusterInfo);
       set('additionalSshOptions', defaults.additionalSshOptions);
-      set('sshHostPrefix', defaults.sshHostPrefix);
-      set('temporarySshConfigPath', defaults.temporarySshConfigPath);
-      set('sshQueryConfigPath', defaults.sshQueryConfigPath);
       set('forwardAgent', defaults.forwardAgent);
       set('requestTTY', defaults.requestTTY);
       scheduleAutoSave();
@@ -9065,19 +9085,15 @@ function getWebviewHtml(webview: vscode.Webview): string {
         identityFile: getValue('identityFile'),
         preSshCommand: getValue('preSshCommand'),
         preSshCheckCommand: getValue('preSshCheckCommand'),
-        autoInstallProxyScriptOnClusterInfo: getValue('autoInstallProxyScriptOnClusterInfo'),
         additionalSshOptions: getValue('additionalSshOptions'),
         moduleLoad: getValue('moduleLoad'),
         moduleSelections: selectedModules.slice(),
         moduleCustomCommand: customModuleCommand,
-        proxyCommand: getValue('proxyCommand'),
-        proxyArgs: getValue('proxyArgs'),
         extraSallocArgs: getValue('extraSallocArgs'),
         promptForExtraSallocArgs: getValue('promptForExtraSallocArgs'),
         sessionMode: getValue('sessionMode'),
         sessionKey: getValue('sessionKey'),
         sessionIdleTimeoutSeconds: getValue('sessionIdleTimeoutSeconds'),
-        sessionStateDir: getValue('sessionStateDir'),
         defaultPartition: getValue('defaultPartition'),
         defaultNodes: getValue('defaultNodes'),
         defaultTasksPerNode: getValue('defaultTasksPerNode'),
@@ -9086,9 +9102,6 @@ function getWebviewHtml(webview: vscode.Webview): string {
         defaultMemoryMb: getValue('defaultMemoryMb'),
         defaultGpuType: getValue('defaultGpuType'),
         defaultGpuCount: getValue('defaultGpuCount'),
-        sshHostPrefix: getValue('sshHostPrefix'),
-        temporarySshConfigPath: getValue('temporarySshConfigPath'),
-        sshQueryConfigPath: getValue('sshQueryConfigPath'),
         forwardAgent: getValue('forwardAgent'),
         requestTTY: getValue('requestTTY'),
         openInNewWindow: getValue('openInNewWindow'),

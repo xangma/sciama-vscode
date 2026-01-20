@@ -24,6 +24,8 @@ Key features:
 
 The extension will query the login host, write a Slurm Connect SSH include file, ensure your SSH config contains a small Slurm Connect Include block (with a note), and connect. It does not replace your SSH config; it only adds the managed block. Local Slurm Connect logs are capped (currently 5 MB) to avoid unbounded growth.
 
+Profiles store the values you edit in the Slurm Connect view (connection, resources, and advanced fields). Global-only settings like the SSH host prefix, managed include path, session state directory, proxy auto-install, and SSH query config live in VS Code Settings under `slurmConnect`.
+
 ## Docs
 - Usage and UI reference: `docs/usage.md`
 - Cluster info and free-resource filtering: `docs/cluster-info.md`

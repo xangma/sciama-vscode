@@ -13,6 +13,8 @@ All notable changes to this project are documented in this file based on git tag
 - Proxy command and proxy args are no longer shown in the UI (advanced overrides remain in settings.json).
 - Existing proxy command/args overrides are reset to defaults on upgrade.
 - Auto-install of the bundled proxy script now runs on connect instead of on Get cluster info.
+- Advanced settings in the view now only show per-profile fields; global-only settings are managed in VS Code settings.
+- Profile saves now capture the full UI state, and UI edits no longer write back to settings (last-used values are cached per scope).
 ### Fixed
 - Profile summary rendering no longer crashes when older profiles omit newer fields.
 - Cluster info errors now clear after a successful refresh.
