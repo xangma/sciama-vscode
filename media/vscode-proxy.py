@@ -133,6 +133,17 @@ class WorkgroupInvoker:
     command: str
 
 
+@dataclass(frozen=True)
+class LocalProxyTunnelConfig:
+    login_host: str
+    login_port: int
+    login_user: Optional[str]
+    proxy_user: str
+    proxy_token: str
+    no_proxy: str
+    timeout: Optional[int]
+
+
 class TeeStream:
     def __init__(self, stream, tee_file=None) -> None:
         self._stream = stream
@@ -1062,8 +1073,12 @@ def build_salloc_command(
     invoker: Optional[WorkgroupInvoker],
     workgroup: Optional[str],
     salloc_args: list[str],
+    command: Optional[list[str]] = None,
 ) -> list[str]:
-    return build_slurm_command(invoker, workgroup, ["salloc", *salloc_args])
+    args = ["salloc", *salloc_args]
+    if command:
+        args.extend(command)
+    return build_slurm_command(invoker, workgroup, args)
 
 
 def build_srun_command(
@@ -1081,6 +1096,116 @@ def build_srun_command(
         args.append("--pty")
     args.extend(shell)
     return build_slurm_command(invoker, workgroup, args)
+
+
+def quote_env_value(value: str) -> str:
+    if "$" in value:
+        return f'"{value}"'
+    return shlex.quote(value)
+
+
+def build_proxy_env_exports(proxy_url: str, no_proxy: str) -> list[str]:
+    exports = [
+        f"export HTTP_PROXY={quote_env_value(proxy_url)}",
+        f"export HTTPS_PROXY={quote_env_value(proxy_url)}",
+        f"export http_proxy={quote_env_value(proxy_url)}",
+        f"export https_proxy={quote_env_value(proxy_url)}",
+        f"export ALL_PROXY={quote_env_value(proxy_url)}",
+        f"export all_proxy={quote_env_value(proxy_url)}",
+    ]
+    if no_proxy:
+        exports.append(f"export NO_PROXY={quote_env_value(no_proxy)}")
+        exports.append(f"export no_proxy={quote_env_value(no_proxy)}")
+    return exports
+
+
+def build_tunnel_shell_command(
+    shell_cmd: list[str], config: LocalProxyTunnelConfig
+) -> list[str]:
+    login_target = config.login_host
+    if config.login_user:
+        login_target = f"{config.login_user}@{login_target}"
+    proxy_url = (
+        f"http://{config.proxy_user}:{config.proxy_token}@127.0.0.1:$LOCAL_PROXY_PORT"
+    )
+    ssh_tokens = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+    ]
+    if config.timeout:
+        ssh_tokens.extend(["-o", f"ConnectTimeout={config.timeout}"])
+    ssh_tokens.extend(
+        [
+            "-N",
+            "-f",
+            "-L",
+            f"127.0.0.1:$LOCAL_PROXY_PORT:127.0.0.1:{config.login_port}",
+            shlex.quote(login_target),
+        ]
+    )
+    ssh_cmd = " ".join(ssh_tokens)
+    pick_port = [
+        "LOCAL_PROXY_PORT=\"\"",
+        "PYTHON=$(command -v python3 || command -v python || true)",
+        "if [ -n \"$PYTHON\" ]; then",
+        "  LOCAL_PROXY_PORT=$($PYTHON - <<'PY'",
+        "import socket",
+        "s=socket.socket()",
+        "s.bind(('127.0.0.1',0))",
+        "print(s.getsockname()[1])",
+        "s.close()",
+        "PY",
+        "  )",
+        "fi",
+        f"if [ -z \"$LOCAL_PROXY_PORT\" ]; then LOCAL_PROXY_PORT={config.login_port}; fi",
+    ]
+    start_tunnel = (
+        f"{ssh_cmd} || {{ echo \"Slurm Connect: proxy tunnel SSH failed\" >&2; exit 1; }}"
+    )
+    wait_cmd = (
+        "for i in $(seq 1 50); do "
+        "(echo > /dev/tcp/127.0.0.1/$LOCAL_PROXY_PORT) >/dev/null 2>&1 && break; "
+        "sleep 0.1; "
+        "done"
+    )
+    verify_cmd = (
+        "(echo > /dev/tcp/127.0.0.1/$LOCAL_PROXY_PORT) >/dev/null 2>&1 "
+        "|| { echo \"Slurm Connect: proxy tunnel failed to open 127.0.0.1:$LOCAL_PROXY_PORT\" >&2; exit 1; }"
+    )
+    exports = build_proxy_env_exports(proxy_url, config.no_proxy)
+    exec_shell_cmd = shell_cmd
+    if shell_cmd and shell_cmd[0] == "/bin/bash" and "-l" in shell_cmd:
+        exec_shell_cmd = ["/bin/bash"]
+    exec_cmd = f"exec {shlex.join(exec_shell_cmd)}"
+    pieces = [*pick_port, start_tunnel, wait_cmd, verify_cmd, *exports, exec_cmd]
+    wrapped = "\n".join(pieces)
+    return ["/bin/bash", "-lc", wrapped]
+
+
+def build_login_proxy_shell_command(
+    shell_cmd: list[str], config: LocalProxyTunnelConfig
+) -> list[str]:
+    proxy_url = (
+        f"http://{config.proxy_user}:{config.proxy_token}@127.0.0.1:{config.login_port}"
+    )
+    exports = build_proxy_env_exports(proxy_url, config.no_proxy)
+    exec_shell_cmd = shell_cmd
+    if shell_cmd and shell_cmd[0] == "/bin/bash" and "-l" in shell_cmd:
+        exec_shell_cmd = ["/bin/bash"]
+    exec_cmd = f"exec {shlex.join(exec_shell_cmd)}"
+    wrapped = "\n".join([*exports, exec_cmd])
+    return ["/bin/bash", "-lc", wrapped]
 
 
 class ProxyServer(threading.Thread):
@@ -1341,6 +1466,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SESSION_STATE_DIR,
         help="Base directory for session state.",
     )
+    parser.add_argument(
+        "--local-proxy-tunnel",
+        action="store_true",
+        help="Start a compute-node SSH tunnel for the local proxy.",
+    )
+    parser.add_argument(
+        "--local-proxy-tunnel-host",
+        default="",
+        help="Login host for the compute-node proxy tunnel.",
+    )
+    parser.add_argument(
+        "--local-proxy-tunnel-user",
+        default="",
+        help="SSH user for the compute-node proxy tunnel.",
+    )
+    parser.add_argument(
+        "--local-proxy-tunnel-port",
+        type=int,
+        default=0,
+        help="Login host port for the proxy tunnel.",
+    )
+    parser.add_argument(
+        "--local-proxy-auth-user",
+        default="",
+        help="Proxy auth user for compute-node HTTP(S) requests.",
+    )
+    parser.add_argument(
+        "--local-proxy-auth-token",
+        default="",
+        help="Proxy auth token for compute-node HTTP(S) requests.",
+    )
+    parser.add_argument(
+        "--local-proxy-no-proxy",
+        default="",
+        help="NO_PROXY value for compute-node HTTP(S) requests.",
+    )
+    parser.add_argument(
+        "--local-proxy-tunnel-timeout",
+        type=int,
+        default=0,
+        help="ConnectTimeout (seconds) for compute-node SSH tunnel.",
+    )
     return parser
 
 
@@ -1515,6 +1682,36 @@ def main() -> int:
         close_tees()
         return 1
 
+    tunnel_config: Optional[LocalProxyTunnelConfig] = None
+    if args.local_proxy_tunnel:
+        missing_fields = []
+        if not args.local_proxy_tunnel_host:
+            missing_fields.append("local-proxy-tunnel-host")
+        if args.local_proxy_tunnel_port <= 0 or args.local_proxy_tunnel_port > 65535:
+            missing_fields.append("local-proxy-tunnel-port")
+        if not args.local_proxy_auth_user:
+            missing_fields.append("local-proxy-auth-user")
+        if not args.local_proxy_auth_token:
+            missing_fields.append("local-proxy-auth-token")
+        if missing_fields:
+            logger.warning(
+                "Local proxy tunnel disabled; missing %s.",
+                ", ".join(missing_fields),
+            )
+        else:
+            tunnel_config = LocalProxyTunnelConfig(
+                login_host=args.local_proxy_tunnel_host,
+                login_port=args.local_proxy_tunnel_port,
+                login_user=args.local_proxy_tunnel_user
+                or None,
+                proxy_user=args.local_proxy_auth_user,
+                proxy_token=args.local_proxy_auth_token,
+                no_proxy=args.local_proxy_no_proxy or "",
+                timeout=args.local_proxy_tunnel_timeout
+                if args.local_proxy_tunnel_timeout > 0
+                else None,
+            )
+
     workgroup: Optional[str] = None
     try:
         invoker = resolve_workgroup_invoker(logger)
@@ -1613,6 +1810,8 @@ def main() -> int:
         #     chosen_node,
         # )
         shell_cmd = ["/bin/bash", "-l"]
+        if tunnel_config:
+            shell_cmd = build_tunnel_shell_command(shell_cmd, tunnel_config)
         use_pty = sys.stdin.isatty() and sys.stdout.isatty()
         command = build_srun_command(
             invoker,
@@ -1624,10 +1823,16 @@ def main() -> int:
         )
         logger.info("Using session %s (job %s).", session_key, session_info.job_id)
     else:
+        shell_cmd = ["/bin/bash", "-l"]
+        if tunnel_config:
+            if exec_server_bootstrap:
+                shell_cmd = build_login_proxy_shell_command(shell_cmd, tunnel_config)
+            else:
+                shell_cmd = build_tunnel_shell_command(shell_cmd, tunnel_config)
         if exec_server_bootstrap:
-            command = ["/bin/bash", "-l"]
+            command = shell_cmd
         else:
-            command = build_salloc_command(invoker, workgroup, args.salloc_arg)
+            command = build_salloc_command(invoker, workgroup, args.salloc_arg, shell_cmd)
 
     logger.info("Launching remote shell: %s", " ".join(command))
     try:

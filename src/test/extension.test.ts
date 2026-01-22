@@ -32,12 +32,14 @@ function testBuildHostEntryQuotes(): void {
     identityFile: '/Users/Test User/.ssh/id_rsa',
     additionalSshOptions: {
       LocalCommand: 'echo hello world'
-    }
+    },
+    extraSshOptions: ['RemoteForward 0.0.0.0:1234 127.0.0.1:5678']
   };
 
   const entry = buildHostEntry('alias', 'login.example.com', cfg, 'echo hi');
   assert.ok(entry.includes('IdentityFile "/Users/Test User/.ssh/id_rsa"'));
   assert.ok(entry.includes('LocalCommand "echo hello world"'));
+  assert.ok(entry.includes('RemoteForward 0.0.0.0:1234 127.0.0.1:5678'));
 }
 
 function testBuildTemporarySshConfigContentIncludes(): void {

@@ -4,6 +4,10 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
 import * as jsonc from 'jsonc-parser';
+import * as http from 'http';
+import * as https from 'https';
+import * as net from 'net';
+import * as zlib from 'zlib';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import {
@@ -44,6 +48,13 @@ interface SlurmConnectConfig {
   moduleLoad: string;
   proxyCommand: string;
   proxyArgs: string[];
+  localProxyEnabled: boolean;
+  localProxyNoProxy: string[];
+  localProxyPort: number;
+  localProxyRemoteBind: string;
+  localProxyRemoteHost: string;
+  localProxyComputeTunnel: boolean;
+  localProxyTunnelMode: LocalProxyTunnelMode;
   extraSallocArgs: string[];
   promptForExtraSallocArgs: boolean;
   sessionMode: SessionMode;
@@ -75,6 +86,7 @@ interface PartitionResult {
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
 type SshAuthMode = 'agent' | 'terminal';
 type SessionMode = 'ephemeral' | 'persistent';
+type LocalProxyTunnelMode = 'remoteSsh' | 'dedicated';
 
 interface SessionSummary {
   sessionKey: string;
@@ -104,6 +116,48 @@ interface ResolvedSshHostInfo {
   hasExplicitHost: boolean;
 }
 
+interface LocalProxyState {
+  server: http.Server;
+  port: number;
+  authUser: string;
+  authToken: string;
+}
+
+interface LocalProxyRuntimeState {
+  port: number;
+  authUser: string;
+  authToken: string;
+  loginHost: string;
+  remoteBind: string;
+}
+
+interface LocalProxyTunnelState {
+  remotePort: number;
+  configKey: string;
+  controlPath: string;
+  target: string;
+}
+
+interface LocalProxyPlan {
+  enabled: boolean;
+  proxyUrl?: string;
+  noProxy?: string;
+  sshOptions?: string[];
+  computeTunnel?: {
+    loginHost: string;
+    loginUser?: string;
+    port: number;
+    authUser: string;
+    authToken: string;
+    noProxy?: string;
+  };
+}
+
+interface LocalProxyEnv {
+  proxyUrl: string;
+  noProxy?: string;
+}
+
 let outputChannel: vscode.OutputChannel | undefined;
 let logFilePath: string | undefined;
 let extensionStoragePath: string | undefined;
@@ -119,6 +173,9 @@ let lastConnectionLoginHost: string | undefined;
 let lastSshAuthPrompt: { identityPath: string; timestamp: number; mode: SshAuthMode } | undefined;
 let preSshCommandInFlight: Promise<void> | undefined;
 let logWriteQueue: Promise<void> = Promise.resolve();
+let localProxyState: LocalProxyState | undefined;
+let localProxyTunnelState: LocalProxyTunnelState | undefined;
+let localProxyConfigKey: string | undefined;
 
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
 const LOG_TRUNCATE_KEEP_BYTES = 4 * 1024 * 1024;
@@ -136,6 +193,8 @@ const LEGACY_CLUSTER_INFO_CACHE_KEY = 'sciamaSlurm.clusterInfoCache';
 const DEFAULT_SESSION_STATE_DIR = '~/.slurm-connect';
 const DEFAULT_PROXY_SCRIPT_INSTALL_PATH = '~/.slurm-connect/vscode-proxy.py';
 const PROXY_OVERRIDE_RESET_KEY = 'slurmConnect.proxyOverrideReset';
+const LOCAL_PROXY_TUNNEL_STATE_KEY = 'slurmConnect.localProxyTunnelState';
+const LOCAL_PROXY_RUNTIME_STATE_KEY = 'slurmConnect.localProxyRuntimeState';
 const CONFIG_KEYS = [
   'loginHosts',
   'loginHostsCommand',
@@ -155,6 +214,13 @@ const CONFIG_KEYS = [
   'moduleLoad',
   'proxyCommand',
   'proxyArgs',
+  'localProxyEnabled',
+  'localProxyNoProxy',
+  'localProxyPort',
+  'localProxyRemoteBind',
+  'localProxyRemoteHost',
+  'localProxyComputeTunnel',
+  'localProxyTunnelMode',
   'extraSallocArgs',
   'promptForExtraSallocArgs',
   'sessionMode',
@@ -224,6 +290,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await migrateClusterSettingsToCache();
   await resetProxyOverridesToDefaults();
   syncConnectionStateFromEnvironment();
+  void resumeLocalProxyForRemoteSession();
   const disposable = vscode.commands.registerCommand('slurmConnect.connect', () => {
     void connectCommand();
   });
@@ -238,7 +305,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 export function deactivate(): void {
-  // No-op
+  stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: false });
 }
 
 async function migrateLegacyState(): Promise<void> {
@@ -915,6 +982,12 @@ interface UiValues {
   moduleCustomCommand?: string;
   proxyCommand: string;
   proxyArgs: string;
+  localProxyEnabled: boolean;
+  localProxyNoProxy: string;
+  localProxyPort: string;
+  localProxyRemoteBind: string;
+  localProxyRemoteHost: string;
+  localProxyComputeTunnel: boolean;
   extraSallocArgs: string;
   promptForExtraSallocArgs: boolean;
   sessionMode: string;
@@ -1148,6 +1221,18 @@ function pickProfileValues(values: Partial<UiValues>): ProfileValues {
     }
   }
   return picked;
+}
+
+function buildWebviewValues(values: UiValues): Partial<UiValues> {
+  return {
+    ...pickProfileValues(values),
+    localProxyEnabled: values.localProxyEnabled,
+    localProxyNoProxy: values.localProxyNoProxy,
+    localProxyPort: values.localProxyPort,
+    localProxyRemoteBind: values.localProxyRemoteBind,
+    localProxyRemoteHost: values.localProxyRemoteHost,
+    localProxyComputeTunnel: values.localProxyComputeTunnel
+  };
 }
 
 function filterProfileValues(values: Partial<UiValues>): { next: ProfileValues; changed: boolean } {
@@ -1432,6 +1517,13 @@ function getConfigFromSettings(): SlurmConnectConfig {
     moduleLoad: (cfg.get<string>('moduleLoad') || '').trim(),
     proxyCommand: (cfg.get<string>('proxyCommand') || '').trim(),
     proxyArgs: cfg.get<string[]>('proxyArgs', []),
+    localProxyEnabled: cfg.get<boolean>('localProxyEnabled', false),
+    localProxyNoProxy: cfg.get<string[]>('localProxyNoProxy', []),
+    localProxyPort: cfg.get<number>('localProxyPort', 0),
+    localProxyRemoteBind: (cfg.get<string>('localProxyRemoteBind') || '').trim(),
+    localProxyRemoteHost: (cfg.get<string>('localProxyRemoteHost') || '').trim(),
+    localProxyComputeTunnel: cfg.get<boolean>('localProxyComputeTunnel', true),
+    localProxyTunnelMode: normalizeLocalProxyTunnelMode(cfg.get<string>('localProxyTunnelMode') || 'remoteSsh'),
     extraSallocArgs: cfg.get<string[]>('extraSallocArgs', []),
     promptForExtraSallocArgs: cfg.get<boolean>('promptForExtraSallocArgs', false),
     sessionMode: normalizeSessionMode(cfg.get<string>('sessionMode') || 'persistent'),
@@ -1485,6 +1577,13 @@ function getConfigDefaultsFromSettings(): SlurmConnectConfig {
     moduleLoad: String(getDefault<string>('moduleLoad', '') || '').trim(),
     proxyCommand: String(getDefault<string>('proxyCommand', '') || '').trim(),
     proxyArgs: getDefault<string[]>('proxyArgs', []),
+    localProxyEnabled: Boolean(getDefault<boolean>('localProxyEnabled', false)),
+    localProxyNoProxy: getDefault<string[]>('localProxyNoProxy', []),
+    localProxyPort: Number(getDefault<number>('localProxyPort', 0)),
+    localProxyRemoteBind: String(getDefault<string>('localProxyRemoteBind', '') || '').trim(),
+    localProxyRemoteHost: String(getDefault<string>('localProxyRemoteHost', '') || '').trim(),
+    localProxyComputeTunnel: Boolean(getDefault<boolean>('localProxyComputeTunnel', true)),
+    localProxyTunnelMode: normalizeLocalProxyTunnelMode(String(getDefault<string>('localProxyTunnelMode', 'remoteSsh') || 'remoteSsh')),
     extraSallocArgs: getDefault<string[]>('extraSallocArgs', []),
     promptForExtraSallocArgs: Boolean(getDefault<boolean>('promptForExtraSallocArgs', false)),
     sessionMode: normalizeSessionMode(String(getDefault<string>('sessionMode', 'persistent') || 'persistent')),
@@ -1559,7 +1658,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           syncConnectionStateFromEnvironment();
           let activeProfile = getActiveProfileName();
           const defaults = getUiValuesFromStorage();
-          const values = pickProfileValues(defaults);
+          const values = buildWebviewValues(defaults);
           if (activeProfile && !getProfileValues(activeProfile)) {
             activeProfile = undefined;
           }
@@ -1569,7 +1668,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           webview.postMessage({
             command: 'load',
             values,
-            defaults: pickProfileValues(getUiDefaultsFromConfig()),
+            defaults: buildWebviewValues(getUiDefaultsFromConfig()),
             clusterInfo: cached?.info,
             clusterInfoCachedAt: cached?.fetchedAt,
             sessions: [],
@@ -1583,14 +1682,14 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             remoteActive: vscode.env.remoteName === 'ssh-remote',
             saveTarget: resolvePreferredSaveTarget()
           });
-          void loadSshHostsForWebview(buildOverridesFromUi(values));
+          void loadSshHostsForWebview(buildOverridesFromUi(pickProfileValues(values)));
           break;
         }
         case 'connect': {
           const target = message.target === 'workspace'
             ? vscode.ConfigurationTarget.Workspace
             : vscode.ConfigurationTarget.Global;
-          const uiValues = message.values as ProfileValues;
+          const uiValues = message.values as Partial<UiValues>;
           const sessionSelection =
             typeof message.sessionSelection === 'string' ? message.sessionSelection.trim() : '';
           await updateConfigFromUi(uiValues, target);
@@ -1611,7 +1710,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           const target = message.target === 'workspace'
             ? vscode.ConfigurationTarget.Workspace
             : vscode.ConfigurationTarget.Global;
-          const uiValues = message.values as ProfileValues;
+          const uiValues = message.values as Partial<UiValues>;
           await updateConfigFromUi(uiValues, target);
           break;
         }
@@ -1620,7 +1719,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           if (!host) {
             break;
           }
-          const uiValues = message.values as ProfileValues | undefined;
+          const uiValues = message.values as Partial<UiValues> | undefined;
           const overrides = uiValues ? buildOverridesFromUi(uiValues) : undefined;
           try {
             const cfg = getConfigWithOverrides(overrides);
@@ -1708,7 +1807,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'saveProfile': {
-          const uiValues = message.values as ProfileValues;
+          const uiValues = message.values as Partial<UiValues>;
           const suggestedRaw = typeof message.suggestedName === 'string' ? message.suggestedName : '';
           const suggestedName = suggestedRaw.trim();
           const nameInput = await vscode.window.showInputBox({
@@ -1867,7 +1966,7 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'getClusterInfo': {
-          const uiValues = message.values as ProfileValues;
+          const uiValues = message.values as Partial<UiValues>;
           await handleClusterInfoRequest(uiValues, webview);
           break;
         }
@@ -2061,23 +2160,13 @@ async function connectCommand(
   const sessionKey = resolveSessionKey(cfg, alias.trim());
   const clientId = vscode.env.sessionId || '';
   const installSnippet = await getProxyInstallSnippet(cfg);
-  const remoteCommand = buildRemoteCommand(
-    cfg,
-    [...sallocArgs, ...cfg.extraSallocArgs, ...extraArgs],
-    sessionKey,
-    clientId,
-    installSnippet
-  );
-  if (!remoteCommand) {
-    void vscode.window.showErrorMessage('RemoteCommand is empty. Check slurmConnect.proxyCommand.');
-    return false;
-  }
+  const tunnelMode = normalizeLocalProxyTunnelMode(cfg.localProxyTunnelMode || 'remoteSsh');
+  const shouldRetryProxyPort = cfg.localProxyEnabled && tunnelMode === 'remoteSsh';
+  const maxProxyPortAttempts = shouldRetryProxyPort ? 3 : 1;
+  let proxyPortCandidates: number[] = [];
+  let localProxyPlan: LocalProxyPlan = { enabled: false };
 
-  const hostEntry = buildHostEntry(alias.trim(), loginHost, cfg, remoteCommand);
-  log.appendLine('Generated SSH host entry:');
-  log.appendLine(redactRemoteCommandForLog(hostEntry));
-
-  await ensureRemoteSshSettings(cfg.sessionMode);
+  await ensureRemoteSshSettings(cfg);
   await migrateStaleRemoteSshConfigIfNeeded();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const currentRemoteConfig = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
@@ -2089,38 +2178,99 @@ async function connectCommand(
       log.appendLine(`SSH config not found at ${baseConfigPath}; creating.`);
     }
   }
+  const includePath = resolveSlurmConnectIncludePath(cfg);
+  if (normalizeSshPath(includePath) === normalizeSshPath(baseConfigPath)) {
+    const message = 'Slurm Connect include file path must not be the same as the SSH config path.';
+    log.appendLine(message);
+    void vscode.window.showErrorMessage(message);
+    return false;
+  }
 
-  try {
-    const includePath = resolveSlurmConnectIncludePath(cfg);
-    if (normalizeSshPath(includePath) === normalizeSshPath(baseConfigPath)) {
-      throw new Error('Slurm Connect include file path must not be the same as the SSH config path.');
+  let preSshReady = false;
+  let connected = false;
+  for (let attempt = 0; attempt < maxProxyPortAttempts; attempt += 1) {
+    const overridePort =
+      shouldRetryProxyPort && proxyPortCandidates.length > 0 ? proxyPortCandidates[attempt] : undefined;
+    try {
+      localProxyPlan = await ensureLocalProxyPlan(cfg, loginHost, { remotePortOverride: overridePort });
+    } catch (error) {
+      const message = `Failed to start local proxy: ${formatError(error)}`;
+      log.appendLine(message);
+      void vscode.window.showErrorMessage(message);
+      return false;
     }
-    await writeSlurmConnectIncludeFile(hostEntry, includePath);
-    const status = await ensureSshIncludeInstalled(baseConfigPath, includePath);
-    log.appendLine(`SSH config include ${status} in ${baseConfigPath}.`);
-  } catch (error) {
-    const message = `Failed to install SSH Include block: ${formatError(error)}`;
-    log.appendLine(message);
-    void vscode.window.showErrorMessage(message);
-    return false;
-  }
-  await delay(300);
-  await refreshRemoteSshHosts();
+    if (shouldRetryProxyPort && proxyPortCandidates.length === 0) {
+      const basePort = localProxyState?.port ?? 0;
+      proxyPortCandidates = buildLocalProxyRemotePortCandidates(basePort, maxProxyPortAttempts);
+    }
+    const localProxyEnv =
+      localProxyPlan.enabled && localProxyPlan.proxyUrl && !localProxyPlan.computeTunnel
+        ? { proxyUrl: localProxyPlan.proxyUrl, noProxy: localProxyPlan.noProxy }
+        : undefined;
+    const remoteCommand = buildRemoteCommand(
+      cfg,
+      [...sallocArgs, ...cfg.extraSallocArgs, ...extraArgs],
+      sessionKey,
+      clientId,
+      installSnippet,
+      localProxyEnv,
+      localProxyPlan
+    );
+    if (!remoteCommand) {
+      void vscode.window.showErrorMessage('RemoteCommand is empty. Check slurmConnect.proxyCommand.');
+      return false;
+    }
 
-  try {
-    await ensurePreSshCommand(cfg, `Remote-SSH connect to ${alias.trim()}`);
-  } catch (error) {
-    const message = `Pre-SSH command failed: ${formatError(error)}`;
-    log.appendLine(message);
-    void vscode.window.showErrorMessage(message);
-    return false;
-  }
+    const hostEntry = buildHostEntry(
+      alias.trim(),
+      loginHost,
+      { ...cfg, extraSshOptions: localProxyPlan.sshOptions },
+      remoteCommand
+    );
+    log.appendLine('Generated SSH host entry:');
+    log.appendLine(redactRemoteCommandForLog(hostEntry));
 
-  const connected = await connectToHost(
-    alias.trim(),
-    cfg.openInNewWindow,
-    cfg.remoteWorkspacePath
-  );
+    try {
+      await writeSlurmConnectIncludeFile(hostEntry, includePath);
+      const status = await ensureSshIncludeInstalled(baseConfigPath, includePath);
+      log.appendLine(`SSH config include ${status} in ${baseConfigPath}.`);
+    } catch (error) {
+      const message = `Failed to install SSH Include block: ${formatError(error)}`;
+      log.appendLine(message);
+      void vscode.window.showErrorMessage(message);
+      return false;
+    }
+    await delay(300);
+    await refreshRemoteSshHosts();
+
+    if (!preSshReady) {
+      try {
+        await ensurePreSshCommand(cfg, `Remote-SSH connect to ${alias.trim()}`);
+      } catch (error) {
+        const message = `Pre-SSH command failed: ${formatError(error)}`;
+        log.appendLine(message);
+        void vscode.window.showErrorMessage(message);
+        return false;
+      }
+      preSshReady = true;
+    }
+
+    connected = await connectToHost(
+      alias.trim(),
+      cfg.openInNewWindow,
+      cfg.remoteWorkspacePath
+    );
+    if (connected) {
+      break;
+    }
+    if (shouldRetryProxyPort && attempt < maxProxyPortAttempts - 1) {
+      const nextPort = proxyPortCandidates[attempt + 1];
+      const message = nextPort
+        ? `Remote-SSH connect failed; retrying local proxy forward on port ${nextPort}.`
+        : 'Remote-SSH connect failed; retrying with an alternate local proxy port.';
+      log.appendLine(message);
+    }
+  }
   didConnect = connected;
   if (connected) {
     lastConnectionSessionKey = sessionKey || undefined;
@@ -2615,7 +2765,7 @@ function applySessionIdleInfo(sessions: SessionSummary[]): SessionSummary[] {
   });
 }
 
-async function handleClusterInfoRequest(values: ProfileValues, webview: vscode.Webview): Promise<void> {
+async function handleClusterInfoRequest(values: Partial<UiValues>, webview: vscode.Webview): Promise<void> {
   if (clusterInfoRequestInFlight) {
     return;
   }
@@ -4679,8 +4829,31 @@ async function cancelPersistentSessionJob(
   }
 }
 
-function buildProxyArgs(cfg: SlurmConnectConfig, sessionKey?: string, clientId?: string): string[] {
+function buildProxyArgs(
+  cfg: SlurmConnectConfig,
+  sessionKey?: string,
+  clientId?: string,
+  localProxyPlan?: LocalProxyPlan
+): string[] {
   const args = cfg.proxyArgs.filter(Boolean);
+  if (localProxyPlan?.computeTunnel) {
+    const tunnel = localProxyPlan.computeTunnel;
+    args.push('--local-proxy-tunnel');
+    args.push(`--local-proxy-tunnel-host=${tunnel.loginHost}`);
+    args.push(`--local-proxy-tunnel-port=${tunnel.port}`);
+    if (tunnel.loginUser) {
+      args.push(`--local-proxy-tunnel-user=${tunnel.loginUser}`);
+    }
+    args.push(`--local-proxy-auth-user=${tunnel.authUser}`);
+    args.push(`--local-proxy-auth-token=${tunnel.authToken}`);
+    const tunnelTimeout = resolveLocalProxyTunnelTimeoutSeconds();
+    if (tunnelTimeout) {
+      args.push(`--local-proxy-tunnel-timeout=${tunnelTimeout}`);
+    }
+    if (tunnel.noProxy) {
+      args.push(`--local-proxy-no-proxy=${tunnel.noProxy}`);
+    }
+  }
   const key = (sessionKey || cfg.sessionKey || '').trim();
   if (cfg.sessionMode !== 'persistent') {
     if (key) {
@@ -4702,6 +4875,826 @@ function buildProxyArgs(cfg: SlurmConnectConfig, sessionKey?: string, clientId?:
     sessionArgs.push(`--session-state-dir=${cfg.sessionStateDir.trim()}`);
   }
   return args.concat(sessionArgs);
+}
+
+const LOCAL_PROXY_AUTH_USER = 'slurm-connect';
+
+function resolveLocalProxyTunnelTimeoutSeconds(): number | undefined {
+  const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
+  const configured = Number(cfg.get<number>('sshConnectTimeoutSeconds', 15));
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.floor(configured);
+  }
+  const remoteTimeout = vscode.workspace.getConfiguration('remote.SSH').get<number>('connectTimeout');
+  if (Number.isFinite(remoteTimeout) && Number(remoteTimeout) > 0) {
+    return Math.floor(Number(remoteTimeout));
+  }
+  return undefined;
+}
+
+function normalizeProxyPort(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  const port = Math.floor(value);
+  if (port < 0 || port > 65535) {
+    return 0;
+  }
+  return port;
+}
+
+function buildLocalProxyRemotePortCandidates(basePort: number, attempts: number): number[] {
+  const total = Math.max(1, Math.floor(attempts || 1));
+  const ports = new Set<number>();
+  const base = normalizeProxyPort(basePort);
+  if (base > 0) {
+    ports.add(base);
+  }
+  const min = 49152;
+  const max = 65535;
+  while (ports.size < total) {
+    const port = Math.floor(Math.random() * (max - min + 1)) + min;
+    if (port > 0) {
+      ports.add(port);
+    }
+  }
+  return Array.from(ports);
+}
+
+async function pickRemoteForwardPort(
+  loginHost: string,
+  cfg: SlurmConnectConfig,
+  bindHost: string
+): Promise<number> {
+  const host = (bindHost || '').trim() || '127.0.0.1';
+  const script = [
+    'import socket',
+    `host=${JSON.stringify(host)}`,
+    's=socket.socket()',
+    's.bind((host,0))',
+    'print(s.getsockname()[1])',
+    's.close()'
+  ].join('\n');
+  const command = [
+    'PYTHON=$(command -v python3 || command -v python || true)',
+    'if [ -z "$PYTHON" ]; then exit 1; fi',
+    '"$PYTHON" - <<\'PY\'',
+    script,
+    'PY'
+  ].join('\n');
+  const output = await runSshCommand(loginHost, cfg, command);
+  const raw = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .pop();
+  const port = raw ? Number(raw) : NaN;
+  if (!Number.isFinite(port) || port <= 0 || port > 65535) {
+    throw new Error(`Unable to parse remote port from: ${output}`);
+  }
+  return Math.floor(port);
+}
+
+function normalizeHostForMatch(host: string): string {
+  const trimmed = (host || '').trim().toLowerCase();
+  if (!trimmed) {
+    return '';
+  }
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed.endsWith('.') ? trimmed.slice(0, -1) : trimmed;
+}
+
+function extractIpv4FromMappedIpv6(host: string): string | undefined {
+  const match = /^(?:0:0:0:0:0:ffff:|::ffff:)(.+)$/.exec(host);
+  if (!match) {
+    return undefined;
+  }
+  const tail = match[1];
+  if (tail.includes('.')) {
+    return net.isIP(tail) === 4 ? tail : undefined;
+  }
+  const parts = tail.split(':');
+  const isHex = (value: string): boolean => /^[0-9a-f]{1,4}$/.test(value);
+  let num: number | undefined;
+  if (parts.length === 2 && parts.every(isHex)) {
+    num = (parseInt(parts[0], 16) << 16) | parseInt(parts[1], 16);
+  } else if (parts.length === 1 && /^[0-9a-f]{1,8}$/.test(parts[0])) {
+    num = parseInt(parts[0], 16);
+  }
+  if (num === undefined || !Number.isFinite(num)) {
+    return undefined;
+  }
+  const bytes = [
+    (num >>> 24) & 0xff,
+    (num >>> 16) & 0xff,
+    (num >>> 8) & 0xff,
+    num & 0xff
+  ];
+  return bytes.join('.');
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = normalizeHostForMatch(host);
+  if (!normalized) {
+    return false;
+  }
+  if (normalized === 'localhost' || normalized === '0.0.0.0' || normalized === '::' || normalized === '::1') {
+    return true;
+  }
+  if (normalized === 'ip6-localhost' || normalized === 'ip6-loopback') {
+    return true;
+  }
+  const ipType = net.isIP(normalized);
+  if (ipType === 4) {
+    return normalized.startsWith('127.') || normalized === '0.0.0.0';
+  }
+  if (ipType === 6) {
+    if (normalized === '0:0:0:0:0:0:0:1') {
+      return true;
+    }
+    const mapped = extractIpv4FromMappedIpv6(normalized);
+    if (mapped) {
+      return mapped.startsWith('127.') || mapped === '0.0.0.0';
+    }
+  }
+  return false;
+}
+
+function splitHostPort(input: string): { host: string; port?: number } {
+  const trimmed = (input || '').trim();
+  if (!trimmed) {
+    return { host: '' };
+  }
+  if (trimmed.startsWith('[')) {
+    const closeIndex = trimmed.indexOf(']');
+    if (closeIndex > 0) {
+      const host = trimmed.slice(1, closeIndex);
+      const rest = trimmed.slice(closeIndex + 1);
+      if (rest.startsWith(':')) {
+        const port = Number(rest.slice(1));
+        return { host, port: Number.isFinite(port) ? port : undefined };
+      }
+      return { host };
+    }
+  }
+  const lastColon = trimmed.lastIndexOf(':');
+  if (lastColon > 0 && trimmed.indexOf(':') === lastColon) {
+    const host = trimmed.slice(0, lastColon);
+    const port = Number(trimmed.slice(lastColon + 1));
+    return { host, port: Number.isFinite(port) ? port : undefined };
+  }
+  return { host: trimmed };
+}
+
+function isHostAllowed(host: string): boolean {
+  if (!host) {
+    return false;
+  }
+  return !isLoopbackHost(host);
+}
+
+function buildNoProxyValue(values: string[]): string {
+  const cleaned = values.map((entry) => entry.trim()).filter(Boolean);
+  if (cleaned.length === 0) {
+    return '';
+  }
+  return uniqueList(cleaned).join(',');
+}
+
+function buildLocalProxyTunnelConfigKey(
+  cfg: SlurmConnectConfig,
+  loginHost: string,
+  remoteBind: string,
+  localPort: number
+): string {
+  return JSON.stringify({
+    loginHost,
+    user: cfg.user || '',
+    identityFile: cfg.identityFile || '',
+    sshQueryConfigPath: cfg.sshQueryConfigPath || '',
+    remoteBind,
+    localPort
+  });
+}
+
+function buildLocalProxyTunnelTarget(cfg: SlurmConnectConfig, loginHost: string): string {
+  return cfg.user ? `${cfg.user}@${loginHost}` : loginHost;
+}
+
+function buildLocalProxyControlPath(key: string): string {
+  const hash = crypto.createHash('sha256').update(key).digest('hex').slice(0, 12);
+  const baseDir = process.platform === 'win32' ? os.tmpdir() : '/tmp';
+  return path.join(baseDir, `slurm-connect-tunnel-${hash}.sock`);
+}
+
+function resolveRemoteBindConnectHost(bindHost: string): string {
+  const trimmed = (bindHost || '').trim().toLowerCase();
+  if (!trimmed || trimmed === '0.0.0.0' || trimmed === '::' || trimmed === '[::]') {
+    return '127.0.0.1';
+  }
+  return trimmed;
+}
+
+async function verifyRemoteForwardListener(
+  cfg: SlurmConnectConfig,
+  loginHost: string,
+  bindHost: string,
+  remotePort: number
+): Promise<boolean> {
+  const host = resolveRemoteBindConnectHost(bindHost);
+  const script = [
+    'import socket,sys',
+    `host=${JSON.stringify(host)}`,
+    `port=${Math.floor(remotePort)}`,
+    's=socket.socket()',
+    's.settimeout(1.5)',
+    'err=s.connect_ex((host,port))',
+    's.close()',
+    'sys.exit(0 if err==0 else 1)'
+  ].join('\n');
+  const command = [
+    'PYTHON=$(command -v python3 || command -v python || true)',
+    'if [ -z "$PYTHON" ]; then exit 1; fi',
+    '"$PYTHON" - <<\'PY\'',
+    script,
+    'PY'
+  ].join('\n');
+  try {
+    await runSshCommand(loginHost, cfg, command);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function loadStoredLocalProxyTunnelState(): LocalProxyTunnelState | undefined {
+  if (!extensionGlobalState) {
+    return undefined;
+  }
+  const stored = extensionGlobalState.get<LocalProxyTunnelState>(LOCAL_PROXY_TUNNEL_STATE_KEY);
+  if (!stored || typeof stored !== 'object') {
+    return undefined;
+  }
+  if (!stored.controlPath || !stored.target || !stored.configKey || !stored.remotePort) {
+    persistLocalProxyTunnelState(undefined);
+    return undefined;
+  }
+  return stored;
+}
+
+function persistLocalProxyTunnelState(state?: LocalProxyTunnelState): void {
+  if (!extensionGlobalState) {
+    return;
+  }
+  void extensionGlobalState.update(LOCAL_PROXY_TUNNEL_STATE_KEY, state);
+}
+
+function loadStoredLocalProxyRuntimeState(): LocalProxyRuntimeState | undefined {
+  if (!extensionGlobalState) {
+    return undefined;
+  }
+  const stored = extensionGlobalState.get<LocalProxyRuntimeState>(LOCAL_PROXY_RUNTIME_STATE_KEY);
+  if (!stored || typeof stored !== 'object') {
+    return undefined;
+  }
+  if (!stored.port || !stored.authUser || !stored.authToken || !stored.loginHost || !stored.remoteBind) {
+    persistLocalProxyRuntimeState(undefined);
+    return undefined;
+  }
+  return stored;
+}
+
+function persistLocalProxyRuntimeState(state?: LocalProxyRuntimeState): void {
+  if (!extensionGlobalState) {
+    return;
+  }
+  void extensionGlobalState.update(LOCAL_PROXY_RUNTIME_STATE_KEY, state);
+}
+
+async function cleanupControlPath(controlPath: string): Promise<void> {
+  if (!controlPath) {
+    return;
+  }
+  try {
+    await fs.unlink(controlPath);
+  } catch {
+    // Ignore cleanup failures.
+  }
+}
+
+async function checkLocalProxyTunnel(state: LocalProxyTunnelState, cfg: SlurmConnectConfig): Promise<boolean> {
+  const args: string[] = [];
+  if (cfg.sshQueryConfigPath) {
+    args.push('-F', expandHome(cfg.sshQueryConfigPath));
+  }
+  args.push('-S', state.controlPath, '-O', 'check');
+  args.push('-o', 'BatchMode=yes', '-o', `ConnectTimeout=${cfg.sshConnectTimeoutSeconds}`);
+  if (cfg.identityFile) {
+    args.push('-i', expandHome(cfg.identityFile));
+  }
+  args.push(state.target);
+  try {
+    await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
+    return true;
+  } catch {
+    await cleanupControlPath(state.controlPath);
+    return false;
+  }
+}
+
+function stopLocalProxyTunnel(): void {
+  const state = localProxyTunnelState ?? loadStoredLocalProxyTunnelState();
+  if (!state) {
+    return;
+  }
+  const args = ['-S', state.controlPath, '-O', 'exit', state.target];
+  void execFileAsync('ssh', args, { timeout: 5000 }).catch(() => undefined);
+  localProxyTunnelState = undefined;
+  persistLocalProxyTunnelState(undefined);
+}
+
+function buildLocalProxyTunnelArgs(
+  cfg: SlurmConnectConfig,
+  loginHost: string,
+  remoteBind: string,
+  remotePort: number,
+  localPort: number,
+  controlPath: string
+): string[] {
+  const args: string[] = [];
+  if (cfg.sshQueryConfigPath) {
+    args.push('-F', expandHome(cfg.sshQueryConfigPath));
+  }
+  args.push('-M', '-S', controlPath);
+  args.push('-N', '-f');
+  args.push('-o', 'BatchMode=yes');
+  args.push('-o', `ConnectTimeout=${cfg.sshConnectTimeoutSeconds}`);
+  args.push('-o', 'ExitOnForwardFailure=yes');
+  args.push('-o', 'ServerAliveInterval=30');
+  args.push('-o', 'ServerAliveCountMax=3');
+  args.push('-R', `${remoteBind}:${remotePort}:127.0.0.1:${localPort}`);
+  if (cfg.identityFile) {
+    args.push('-i', expandHome(cfg.identityFile));
+  }
+  args.push(buildLocalProxyTunnelTarget(cfg, loginHost));
+  return args;
+}
+
+async function startLocalProxyTunnel(
+  cfg: SlurmConnectConfig,
+  loginHost: string,
+  remoteBind: string,
+  localPort: number,
+  configKey: string
+): Promise<LocalProxyTunnelState> {
+  const log = getOutputChannel();
+  const maxAttempts = 3;
+  let lastError: Error | undefined;
+  const target = buildLocalProxyTunnelTarget(cfg, loginHost);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let remotePort: number;
+    try {
+      remotePort = await pickRemoteForwardPort(loginHost, cfg, remoteBind);
+    } catch (error) {
+      lastError = error as Error;
+      break;
+    }
+    const controlPath = buildLocalProxyControlPath(`${configKey}:${remotePort}`);
+    await cleanupControlPath(controlPath);
+    log.appendLine(
+      `Starting local proxy tunnel (${attempt}/${maxAttempts}): ${remoteBind}:${remotePort} -> 127.0.0.1:${localPort}`
+    );
+    const args = buildLocalProxyTunnelArgs(cfg, loginHost, remoteBind, remotePort, localPort, controlPath);
+    try {
+      const { stderr } = await execFileAsync('ssh', args, { timeout: cfg.sshConnectTimeoutSeconds * 1000 });
+      if (stderr && /remote port forwarding failed/i.test(stderr)) {
+        log.appendLine(`Local proxy tunnel SSH warning: ${stderr.trim()}`);
+        lastError = new Error('Remote port forwarding failed');
+        await cleanupControlPath(controlPath);
+        continue;
+      }
+    } catch (error) {
+      const errorText = normalizeSshErrorText(error);
+      const summary = pickSshErrorSummary(errorText);
+      log.appendLine(`Local proxy tunnel SSH failed: ${summary || errorText}`);
+      lastError = new Error(summary || 'SSH tunnel failed');
+      continue;
+    }
+    const state: LocalProxyTunnelState = {
+      remotePort,
+      configKey,
+      controlPath,
+      target
+    };
+    if (!(await checkLocalProxyTunnel(state, cfg))) {
+      log.appendLine('Local proxy tunnel did not respond to control check.');
+      await cleanupControlPath(controlPath);
+      lastError = new Error('SSH tunnel failed to start.');
+      continue;
+    }
+    if (!(await verifyRemoteForwardListener(cfg, loginHost, remoteBind, remotePort))) {
+      log.appendLine(`Local proxy tunnel listener not detected on ${remoteBind}:${remotePort}.`);
+      await cleanupControlPath(controlPath);
+      lastError = new Error('Remote proxy listener not available.');
+      continue;
+    }
+    persistLocalProxyTunnelState(state);
+    log.appendLine(`Local proxy tunnel ready on ${remoteBind}:${remotePort}`);
+    return state;
+  }
+
+  throw lastError ?? new Error('Failed to start local proxy tunnel.');
+}
+
+async function ensureLocalProxyTunnel(
+  cfg: SlurmConnectConfig,
+  loginHost: string,
+  remoteBind: string,
+  localPort: number
+): Promise<number> {
+  const configKey = buildLocalProxyTunnelConfigKey(cfg, loginHost, remoteBind, localPort);
+  const inMemory = localProxyTunnelState;
+  if (inMemory && inMemory.configKey === configKey) {
+    if (await checkLocalProxyTunnel(inMemory, cfg)) {
+      return inMemory.remotePort;
+    }
+    stopLocalProxyTunnel();
+  }
+  const stored = loadStoredLocalProxyTunnelState();
+  if (stored && stored.configKey === configKey) {
+    if (await checkLocalProxyTunnel(stored, cfg)) {
+      localProxyTunnelState = stored;
+      return stored.remotePort;
+    }
+    stopLocalProxyTunnel();
+  }
+  stopLocalProxyTunnel();
+  const state = await startLocalProxyTunnel(cfg, loginHost, remoteBind, localPort, configKey);
+  localProxyTunnelState = state;
+  return state.remotePort;
+}
+
+function parseProxyTarget(req: http.IncomingMessage): {
+  hostname: string;
+  port: number;
+  path: string;
+  isHttps: boolean;
+  hostHeader: string;
+} | null {
+  const rawUrl = String(req.url || '');
+  let parsed: URL;
+  if (/^https?:\/\//i.test(rawUrl)) {
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      return null;
+    }
+  } else {
+    const hostHeader = String(req.headers.host || '').trim();
+    if (!hostHeader) {
+      return null;
+    }
+    try {
+      parsed = new URL(`http://${hostHeader}${rawUrl}`);
+    } catch {
+      return null;
+    }
+  }
+  const hostname = parsed.hostname;
+  const isHttps = parsed.protocol === 'https:';
+  const port = parsed.port ? Number(parsed.port) : isHttps ? 443 : 80;
+  if (!hostname || !Number.isFinite(port)) {
+    return null;
+  }
+  const path = `${parsed.pathname || '/'}${parsed.search || ''}`;
+  const hostHeader = (() => {
+    const isIpv6 = net.isIP(hostname) === 6;
+    if (parsed.port) {
+      return isIpv6 ? `[${hostname}]:${parsed.port}` : `${hostname}:${parsed.port}`;
+    }
+    return isIpv6 ? `[${hostname}]` : hostname;
+  })();
+  return {
+    hostname,
+    port,
+    path,
+    isHttps,
+    hostHeader
+  };
+}
+
+function isProxyAuthValid(req: http.IncomingMessage, authUser: string, authToken: string): boolean {
+  const header = req.headers['proxy-authorization'];
+  if (!header) {
+    return false;
+  }
+  const value = Array.isArray(header) ? header[0] : header;
+  const match = /^Basic\s+(.+)$/i.exec(value.trim());
+  if (!match) {
+    return false;
+  }
+  let decoded = '';
+  try {
+    decoded = Buffer.from(match[1], 'base64').toString('utf8');
+  } catch {
+    return false;
+  }
+  const separatorIndex = decoded.indexOf(':');
+  if (separatorIndex < 0) {
+    return false;
+  }
+  const user = decoded.slice(0, separatorIndex);
+  const pass = decoded.slice(separatorIndex + 1);
+  return user === authUser && pass === authToken;
+}
+
+function respondProxyAuthRequired(res: http.ServerResponse): void {
+  res.writeHead(407, {
+    'Proxy-Authenticate': 'Basic realm="Slurm Connect"',
+    Connection: 'close'
+  });
+  res.end('Proxy authentication required.');
+}
+
+function respondProxyAuthRequiredSocket(socket: net.Socket): void {
+  socket.write('HTTP/1.1 407 Proxy Authentication Required\r\n');
+  socket.write('Proxy-Authenticate: Basic realm="Slurm Connect"\r\n');
+  socket.write('Connection: close\r\n\r\n');
+  socket.destroy();
+}
+
+async function startLocalProxyServer(
+  port: number,
+  authOverride?: { authUser: string; authToken: string }
+): Promise<LocalProxyState> {
+  const authUser = authOverride?.authUser || LOCAL_PROXY_AUTH_USER;
+  const authToken = authOverride?.authToken || crypto.randomBytes(18).toString('hex');
+  const server = http.createServer((req, res) => {
+    if (!isProxyAuthValid(req, authUser, authToken)) {
+      respondProxyAuthRequired(res);
+      return;
+    }
+    const target = parseProxyTarget(req);
+    if (!target) {
+      res.writeHead(400, { Connection: 'close' });
+      res.end('Unable to parse proxy target.');
+      return;
+    }
+    if (!isHostAllowed(target.hostname)) {
+      res.writeHead(403, { Connection: 'close' });
+      res.end('Proxy target not allowed.');
+      return;
+    }
+    const headers = { ...req.headers };
+    delete headers['proxy-authorization'];
+    delete headers['proxy-connection'];
+    delete headers['connection'];
+    headers.host = target.hostHeader;
+    const requestOptions = {
+      hostname: target.hostname,
+      port: target.port,
+      method: req.method,
+      path: target.path,
+      headers
+    };
+    const proxyReq = (target.isHttps ? https : http).request(requestOptions, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+    proxyReq.on('error', () => {
+      res.writeHead(502, { Connection: 'close' });
+      res.end('Proxy request failed.');
+    });
+    req.pipe(proxyReq);
+  });
+
+  server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
+    if (!isProxyAuthValid(req, authUser, authToken)) {
+      respondProxyAuthRequiredSocket(clientSocket);
+      return;
+    }
+    const targetValue = String(req.url || '').trim();
+    const { host, port: targetPort } = splitHostPort(targetValue);
+    if (!host || !targetPort) {
+      clientSocket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+    if (!isHostAllowed(host)) {
+      clientSocket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+    const upstream = net.connect(targetPort, host, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head && head.length > 0) {
+        upstream.write(head);
+      }
+      clientSocket.pipe(upstream);
+      upstream.pipe(clientSocket);
+    });
+    upstream.on('error', () => {
+      clientSocket.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+      clientSocket.destroy();
+    });
+  });
+
+  server.on('clientError', (_err, socket) => {
+    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+  });
+
+  return await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => {
+      server.removeListener('error', reject);
+      const address = server.address() as net.AddressInfo | null;
+      if (!address) {
+        reject(new Error('Failed to resolve local proxy server address.'));
+        return;
+      }
+      resolve({
+        server,
+        port: address.port,
+        authUser,
+        authToken
+      });
+    });
+  });
+}
+
+function stopLocalProxyServer(options?: { stopTunnel?: boolean; clearRuntimeState?: boolean }): void {
+  const stopTunnel = options?.stopTunnel !== false;
+  const clearRuntimeState = options?.clearRuntimeState !== false;
+  if (stopTunnel) {
+    stopLocalProxyTunnel();
+  }
+  if (!localProxyState) {
+    if (clearRuntimeState) {
+      persistLocalProxyRuntimeState(undefined);
+    }
+    return;
+  }
+  try {
+    localProxyState.server.close();
+  } catch {
+    // Ignore shutdown errors.
+  }
+  localProxyState = undefined;
+  localProxyConfigKey = undefined;
+  if (clearRuntimeState) {
+    persistLocalProxyRuntimeState(undefined);
+  }
+}
+
+function buildLocalProxyRuntimeState(
+  loginHost: string,
+  remoteBind: string,
+  state: LocalProxyState
+): LocalProxyRuntimeState {
+  return {
+    port: state.port,
+    authUser: state.authUser,
+    authToken: state.authToken,
+    loginHost,
+    remoteBind
+  };
+}
+
+async function resumeLocalProxyForRemoteSession(): Promise<void> {
+  if (vscode.env.remoteName !== 'ssh-remote') {
+    return;
+  }
+  const cfg = getConfig();
+  if (!cfg.localProxyEnabled) {
+    stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: true });
+    return;
+  }
+  const storedRuntime = loadStoredLocalProxyRuntimeState();
+  if (!storedRuntime) {
+    return;
+  }
+  const log = getOutputChannel();
+  const configKey = JSON.stringify({ port: normalizeProxyPort(cfg.localProxyPort) });
+  const tunnelMode = normalizeLocalProxyTunnelMode(cfg.localProxyTunnelMode || 'remoteSsh');
+  if (!localProxyState) {
+    try {
+      localProxyState = await startLocalProxyServer(storedRuntime.port, {
+        authUser: storedRuntime.authUser,
+        authToken: storedRuntime.authToken
+      });
+      localProxyConfigKey = configKey;
+      log.appendLine(`Local proxy resumed on 127.0.0.1:${localProxyState.port}`);
+    } catch (error) {
+      log.appendLine(`Failed to resume local proxy: ${formatError(error)}`);
+      persistLocalProxyRuntimeState(undefined);
+      return;
+    }
+  }
+  if (tunnelMode === 'dedicated') {
+    try {
+      await ensureLocalProxyTunnel(cfg, storedRuntime.loginHost, storedRuntime.remoteBind, storedRuntime.port);
+    } catch (error) {
+      log.appendLine(`Failed to resume local proxy tunnel: ${formatError(error)}`);
+    }
+  } else {
+    stopLocalProxyTunnel();
+  }
+}
+
+async function ensureLocalProxyPlan(
+  cfg: SlurmConnectConfig,
+  loginHost: string,
+  options?: { remotePortOverride?: number }
+): Promise<LocalProxyPlan> {
+  if (!cfg.localProxyEnabled) {
+    if (localProxyState && connectionState !== 'connected') {
+      stopLocalProxyServer();
+    }
+    return { enabled: false };
+  }
+  const log = getOutputChannel();
+  const remoteBindInput = (cfg.localProxyRemoteBind || '').trim() || '0.0.0.0';
+  const remoteBind = cfg.localProxyComputeTunnel ? '127.0.0.1' : remoteBindInput;
+  const tunnelMode = normalizeLocalProxyTunnelMode(cfg.localProxyTunnelMode || 'remoteSsh');
+  const localPort = normalizeProxyPort(cfg.localProxyPort);
+  const configKey = JSON.stringify({ port: localPort });
+  if (!localProxyState || localProxyConfigKey !== configKey) {
+    stopLocalProxyServer({ stopTunnel: false, clearRuntimeState: false });
+    const storedRuntime = loadStoredLocalProxyRuntimeState();
+    const canResume = Boolean(
+      storedRuntime &&
+        storedRuntime.loginHost === loginHost &&
+        storedRuntime.remoteBind === remoteBind &&
+        (localPort === 0 || storedRuntime.port === localPort)
+    );
+    if (canResume && storedRuntime) {
+      try {
+        localProxyState = await startLocalProxyServer(storedRuntime.port, {
+          authUser: storedRuntime.authUser,
+          authToken: storedRuntime.authToken
+        });
+        localProxyConfigKey = configKey;
+        log.appendLine(`Local proxy resumed on 127.0.0.1:${localProxyState.port}`);
+      } catch (error) {
+        log.appendLine(`Failed to resume local proxy: ${formatError(error)}`);
+        persistLocalProxyRuntimeState(undefined);
+      }
+    }
+    if (!localProxyState) {
+      try {
+        localProxyState = await startLocalProxyServer(localPort);
+        localProxyConfigKey = configKey;
+        log.appendLine(`Local proxy listening on 127.0.0.1:${localProxyState.port}`);
+      } catch (error) {
+        log.appendLine(`Failed to start local proxy: ${formatError(error)}`);
+        throw error;
+      }
+    }
+  }
+  const remoteHost = (cfg.localProxyRemoteHost || '').trim() || loginHost;
+  const proxyPort = localProxyState.port;
+  let remotePort: number;
+  let sshOptions: string[] | undefined;
+  if (tunnelMode === 'dedicated') {
+    try {
+      remotePort = await ensureLocalProxyTunnel(cfg, loginHost, remoteBind, proxyPort);
+    } catch (error) {
+      getOutputChannel().appendLine(`Failed to start local proxy tunnel: ${formatError(error)}`);
+      throw error;
+    }
+  } else {
+    stopLocalProxyTunnel();
+    const overridePort = normalizeProxyPort(options?.remotePortOverride ?? proxyPort);
+    remotePort = overridePort || proxyPort;
+    sshOptions = [
+      `RemoteForward ${remoteBind}:${remotePort} 127.0.0.1:${proxyPort}`,
+      'ExitOnForwardFailure yes'
+    ];
+  }
+  persistLocalProxyRuntimeState(buildLocalProxyRuntimeState(loginHost, remoteBind, localProxyState));
+  const noProxy = buildNoProxyValue(cfg.localProxyNoProxy);
+  const computeTunnel = cfg.localProxyComputeTunnel
+    ? {
+        loginHost: remoteHost || loginHost,
+        loginUser: cfg.user || undefined,
+        port: remotePort,
+        authUser: localProxyState.authUser,
+        authToken: localProxyState.authToken,
+        noProxy: noProxy || undefined
+      }
+    : undefined;
+  const proxyHostForEnv = computeTunnel ? '127.0.0.1' : remoteHost;
+  const proxyUrl = `http://${localProxyState.authUser}:${localProxyState.authToken}@${proxyHostForEnv}:${remotePort}`;
+  return {
+    enabled: true,
+    proxyUrl,
+    noProxy: noProxy || undefined,
+    sshOptions,
+    computeTunnel
+  };
 }
 
 function escapeModuleLoadCommand(command: string): string {
@@ -4774,20 +5767,42 @@ function escapeModuleLoadCommand(command: string): string {
   return result.join(' ');
 }
 
+function buildProxyEnvTokens(env?: LocalProxyEnv): string[] {
+  if (!env || !env.proxyUrl) {
+    return [];
+  }
+  const tokens = [
+    'env',
+    `HTTP_PROXY=${env.proxyUrl}`,
+    `HTTPS_PROXY=${env.proxyUrl}`,
+    `http_proxy=${env.proxyUrl}`,
+    `https_proxy=${env.proxyUrl}`,
+    `ALL_PROXY=${env.proxyUrl}`,
+    `all_proxy=${env.proxyUrl}`
+  ];
+  if (env.noProxy) {
+    tokens.push(`NO_PROXY=${env.noProxy}`, `no_proxy=${env.noProxy}`);
+  }
+  return tokens;
+}
+
 function buildRemoteCommand(
   cfg: SlurmConnectConfig,
   sallocArgs: string[],
   sessionKey?: string,
   clientId?: string,
-  installSnippet?: string
+  installSnippet?: string,
+  localProxyEnv?: LocalProxyEnv,
+  localProxyPlan?: LocalProxyPlan
 ): string {
   const proxyTokens = splitShellArgs(cfg.proxyCommand);
   if (proxyTokens.length === 0) {
     return '';
   }
-  const proxyArgs = buildProxyArgs(cfg, sessionKey, clientId);
+  const envTokens = buildProxyEnvTokens(localProxyEnv);
+  const proxyArgs = buildProxyArgs(cfg, sessionKey, clientId, localProxyPlan);
   const sallocFlags = sallocArgs.map((arg) => `--salloc-arg=${arg}`);
-  const fullProxyCommand = joinShellCommand([...proxyTokens, ...proxyArgs, ...sallocFlags]);
+  const fullProxyCommand = joinShellCommand([...envTokens, ...proxyTokens, ...proxyArgs, ...sallocFlags]);
   const moduleLoad = cfg.moduleLoad ? escapeModuleLoadCommand(cfg.moduleLoad) : '';
   const baseCommand = moduleLoad
     ? `${moduleLoad} && ${fullProxyCommand}`.trim()
@@ -5678,7 +6693,7 @@ async function ensureLocalServerSetting(): Promise<void> {
 }
 
 
-async function ensureRemoteSshSettings(sessionMode?: SessionMode): Promise<void> {
+async function ensureRemoteSshSettings(cfg: SlurmConnectConfig): Promise<void> {
   await ensureLocalServerSetting();
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const enableRemoteCommand = remoteCfg.get<boolean>('enableRemoteCommand', false);
@@ -5705,8 +6720,21 @@ async function ensureRemoteSshSettings(sessionMode?: SessionMode): Promise<void>
     }
   }
 
+  const tunnelMode = normalizeLocalProxyTunnelMode(cfg.localProxyTunnelMode || 'remoteSsh');
   const useExecServer = remoteCfg.get<boolean>('useExecServer', true);
-  if (useExecServer && sessionMode === 'persistent') {
+  if (useExecServer && cfg.localProxyEnabled && tunnelMode === 'remoteSsh') {
+    const disable = await vscode.window.showWarningMessage(
+      'Remote.SSH: Use Exec Server opens a second SSH connection, which breaks the single-connection local proxy. Disable it?',
+      'Disable',
+      'Ignore'
+    );
+    if (disable === 'Disable') {
+      await remoteCfg.update('useExecServer', false, vscode.ConfigurationTarget.Global);
+    }
+  }
+
+  const updatedUseExecServer = remoteCfg.get<boolean>('useExecServer', true);
+  if (updatedUseExecServer && cfg.sessionMode === 'persistent') {
     const disable = await vscode.window.showWarningMessage(
       'Remote.SSH: Use Exec Server is enabled. This can prevent reconnecting to persistent Slurm sessions.',
       'Disable',
@@ -5827,6 +6855,10 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
   await remoteExtension.activate();
   const availableCommands = await vscode.commands.getCommands(true);
   const sshCommands = availableCommands.filter((command) => /ssh|openssh|remote\.close/i.test(command));
+  const finalizeDisconnect = (): boolean => {
+    stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: true });
+    return true;
+  };
 
   if (vscode.env.remoteName === 'ssh-remote') {
     const directCommands = [
@@ -5841,7 +6873,7 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
         log.appendLine(`Trying disconnect command: ${command}`);
         await vscode.commands.executeCommand(command);
         log.appendLine(`Disconnect command succeeded: ${command}`);
-        return true;
+        return finalizeDisconnect();
       } catch (error) {
         log.appendLine(`Disconnect command failed: ${command} -> ${formatError(error)}`);
       }
@@ -5880,7 +6912,7 @@ async function disconnectFromHost(alias?: string): Promise<boolean> {
       log.appendLine(`Trying disconnect command: ${command}`);
       await vscode.commands.executeCommand(command, args);
       log.appendLine(`Disconnect command succeeded: ${command}`);
-      return true;
+      return finalizeDisconnect();
     } catch (error) {
       log.appendLine(`Disconnect command failed: ${command} -> ${formatError(error)}`);
     }
@@ -5962,6 +6994,12 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     moduleCustomCommand: getCachedUiValue(cache, 'moduleCustomCommand'),
     proxyCommand: fromCache('proxyCommand', cfg.proxyCommand || ''),
     proxyArgs: fromCache('proxyArgs', cfg.proxyArgs.join('\n')),
+    localProxyEnabled: cfg.localProxyEnabled,
+    localProxyNoProxy: cfg.localProxyNoProxy.join('\n'),
+    localProxyPort: String(cfg.localProxyPort ?? 0),
+    localProxyRemoteBind: cfg.localProxyRemoteBind || '',
+    localProxyRemoteHost: cfg.localProxyRemoteHost || '',
+    localProxyComputeTunnel: cfg.localProxyComputeTunnel,
     extraSallocArgs: fromCache('extraSallocArgs', cfg.extraSallocArgs.join('\n')),
     promptForExtraSallocArgs: fromCache('promptForExtraSallocArgs', cfg.promptForExtraSallocArgs),
     sessionMode: fromCache('sessionMode', cfg.sessionMode || 'persistent'),
@@ -5993,8 +7031,48 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
   };
 }
 
-async function updateConfigFromUi(values: ProfileValues, target: vscode.ConfigurationTarget): Promise<void> {
-  await updateClusterUiCache(values, target);
+async function updateConfigFromUi(values: Partial<UiValues>, target: vscode.ConfigurationTarget): Promise<void> {
+  await updateClusterUiCache(pickProfileValues(values), target);
+  await updateLocalProxySettingsFromUi(values, target);
+}
+
+async function updateLocalProxySettingsFromUi(
+  values: Partial<UiValues>,
+  target: vscode.ConfigurationTarget
+): Promise<void> {
+  const has = (key: keyof UiValues): boolean => Object.prototype.hasOwnProperty.call(values, key);
+  const cfg = vscode.workspace.getConfiguration(SETTINGS_SECTION);
+  const updates: Array<Thenable<void>> = [];
+  if (has('localProxyEnabled')) {
+    updates.push(cfg.update('localProxyEnabled', Boolean(values.localProxyEnabled), target));
+  }
+  if (has('localProxyNoProxy')) {
+    const list = parseListInput(String(values.localProxyNoProxy ?? ''));
+    updates.push(cfg.update('localProxyNoProxy', list, target));
+  }
+  if (has('localProxyPort')) {
+    const raw = String(values.localProxyPort ?? '').trim();
+    const parsed = raw ? Number(raw) : 0;
+    const port = normalizeProxyPort(parsed);
+    updates.push(cfg.update('localProxyPort', port, target));
+  }
+  if (has('localProxyRemoteBind')) {
+    updates.push(cfg.update('localProxyRemoteBind', String(values.localProxyRemoteBind ?? '').trim(), target));
+  }
+  if (has('localProxyRemoteHost')) {
+    updates.push(cfg.update('localProxyRemoteHost', String(values.localProxyRemoteHost ?? '').trim(), target));
+  }
+  if (has('localProxyComputeTunnel')) {
+    updates.push(cfg.update('localProxyComputeTunnel', Boolean(values.localProxyComputeTunnel), target));
+  }
+  if (updates.length === 0) {
+    return;
+  }
+  try {
+    await Promise.all(updates);
+  } catch (error) {
+    getOutputChannel().appendLine(`Failed to update local proxy settings: ${formatError(error)}`);
+  }
 }
 
 function buildClusterOverridesFromUi(values: ClusterUiCache): Partial<SlurmConnectConfig> {
@@ -6084,7 +7162,7 @@ function redactRemoteCommandForLog(entry: string): string {
       return line;
     }
     const command = line.slice(match[1].length);
-    const redacted = command.replace(
+    const redactedBase64 = command.replace(
       /echo\s+([A-Za-z0-9+/=]{20,})\s+\|\s*base64\s+-d/g,
       (_full, b64) => {
         if (b64.length <= 25) {
@@ -6095,6 +7173,11 @@ function redactRemoteCommandForLog(entry: string): string {
         return `echo ${head}...${tail} | base64 -d`;
       }
     );
+    const redactedProxyArgs = redactedBase64.replace(
+      /--local-proxy-auth-token=([^\s]+)/g,
+      '--local-proxy-auth-token=***'
+    );
+    const redacted = redactedProxyArgs.replace(/:\/\/([^:@\s]+):([^@/\s]+)@/g, '://$1:***@');
     return `${match[1]}${redacted}`;
   });
   return `${lines.join('\n')}\n`;
@@ -6160,7 +7243,8 @@ async function getBundledProxyScript(): Promise<BundledProxyScript | undefined> 
   try {
     const data = await fs.readFile(filePath);
     const sha256 = crypto.createHash('sha256').update(data).digest('hex');
-    const base64 = data.toString('base64');
+    const compressed = zlib.gzipSync(data, { level: 9 });
+    const base64 = compressed.toString('base64');
     bundledProxyScriptCache = { base64, sha256 };
     return bundledProxyScriptCache;
   } catch (error) {
@@ -6185,7 +7269,7 @@ function buildProxyInstallSnippet(plan: ProxyInstallPlan): string {
   const targetEscaped = target.replace(/"/g, '\\"');
   const expected = plan.sha256;
   const chunks: string[] = [];
-  const chunkSize = 76;
+  const chunkSize = 1024;
   for (let i = 0; i < plan.base64.length; i += chunkSize) {
     chunks.push(plan.base64.slice(i, i + chunkSize));
   }
@@ -6201,9 +7285,14 @@ function buildProxyInstallSnippet(plan: ProxyInstallPlan): string {
   const installSnippet = [
     `target="${targetEscaped}"`,
     `expected="${expected}"`,
+    'PYTHON=$(command -v python3 || command -v python || true)',
+    'if [ -z "$PYTHON" ]; then',
+    '  echo "Slurm Connect: python not found; cannot install proxy." >&2',
+    '  exit 1',
+    'fi',
     'current=""',
     'if [ -f "$target" ]; then',
-    '  current=$(python - "$target" 2>/dev/null <<\'PY\'',
+    '  current=$("$PYTHON" - "$target" 2>/dev/null <<\'PY\'',
     hashSnippet,
     'PY',
     '  )',
@@ -6211,19 +7300,23 @@ function buildProxyInstallSnippet(plan: ProxyInstallPlan): string {
     'if [ "$current" != "$expected" ]; then',
     '  umask 077',
     '  mkdir -p "$(dirname "$target")"',
-    '  python - "$target" <<\'PY\'',
-    'import base64,os,sys',
+    '  "$PYTHON" - "$target" <<\'PY\'',
+    'import base64,gzip,io,os,sys',
     'path=sys.argv[1]',
     'data=base64.b64decode("".join([',
     ...chunks.map((chunk) => `    "${chunk}",`),
     ']))',
+    'try:',
+    '    data=gzip.decompress(data)',
+    'except AttributeError:',
+    '    data=gzip.GzipFile(fileobj=io.BytesIO(data)).read()',
     'tmp=path + ".tmp"',
     'with open(tmp,"wb") as f:',
     '    f.write(data)',
     'os.chmod(tmp,0o700)',
     'os.replace(tmp,path)',
     'PY',
-    '  current=$(python - "$target" 2>/dev/null <<\'PY\'',
+    '  current=$("$PYTHON" - "$target" 2>/dev/null <<\'PY\'',
     hashSnippet,
     'PY',
     '  )',
@@ -6329,7 +7422,11 @@ function normalizeSessionMode(value: string): SessionMode {
   return value === 'persistent' ? 'persistent' : 'ephemeral';
 }
 
-function buildOverridesFromUi(values: ProfileValues): Partial<SlurmConnectConfig> {
+function normalizeLocalProxyTunnelMode(value: string): LocalProxyTunnelMode {
+  return value === 'dedicated' ? 'dedicated' : 'remoteSsh';
+}
+
+function buildOverridesFromUi(values: Partial<UiValues>): Partial<SlurmConnectConfig> {
   const moduleLoad = String(values.moduleLoad ?? '').trim();
   const moduleCustom = normalizeModuleCustomCommand(values.moduleCustomCommand);
   const moduleSelections = normalizeModuleSelections(values.moduleSelections);
@@ -6923,6 +8020,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
     <label for="additionalSshOptions">Additional SSH options (one per line)</label>
     <textarea id="additionalSshOptions" rows="3" placeholder=""></textarea>
     <div class="checkbox">
+      <input id="localProxyEnabled" type="checkbox" />
+      <label for="localProxyEnabled">Route remote HTTP(S) through local proxy</label>
+    </div>
+    <div class="hint">Advanced local proxy settings live in VS Code Settings.</div>
+    <div class="checkbox">
       <input id="forwardAgent" type="checkbox" />
       <label for="forwardAgent">Forward agent</label>
     </div>
@@ -7157,6 +8259,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       set('preSshCommand', defaults.preSshCommand);
       set('preSshCheckCommand', defaults.preSshCheckCommand);
       set('additionalSshOptions', defaults.additionalSshOptions);
+      set('localProxyEnabled', defaults.localProxyEnabled);
       set('forwardAgent', defaults.forwardAgent);
       set('requestTTY', defaults.requestTTY);
       scheduleAutoSave();
@@ -9104,6 +10207,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         moduleLoad: getValue('moduleLoad'),
         moduleSelections: selectedModules.slice(),
         moduleCustomCommand: customModuleCommand,
+        localProxyEnabled: getValue('localProxyEnabled'),
         extraSallocArgs: getValue('extraSallocArgs'),
         promptForExtraSallocArgs: getValue('promptForExtraSallocArgs'),
         sessionMode: getValue('sessionMode'),

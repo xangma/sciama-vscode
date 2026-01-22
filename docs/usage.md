@@ -51,6 +51,7 @@ Profiles include connection, resource, and advanced form values.
 - **Pre-SSH auth command (optional)**: Local command run before SSH queries/connect (e.g., `step ssh login`).
 - **Pre-SSH check command (optional)**: Local non-interactive check; exit 0 skips the pre-SSH auth command.
 - **Additional SSH options (one per line)**: Extra SSH config lines added to generated host entries.
+- **Local proxy**: Enable a local HTTP(S) proxy (advanced options live in Settings).
 - **Forward agent**: Adds `ForwardAgent yes` to generated host entries.
 - **Request TTY**: Adds `RequestTTY yes` to generated host entries.
 - **Remember values in**: Stores last-used UI values in user or workspace scope.
@@ -60,7 +61,7 @@ Profiles include connection, resource, and advanced form values.
 - **Open logs**: Opens the Slurm Connect output log (capped at 5 MB; older entries are truncated).
 - **Remote-SSH log**: Opens the Remote-SSH log.
 
-Global settings such as the SSH host prefix, managed include path, session state directory, proxy auto-install, and SSH query config path live in VS Code Settings (`slurmConnect`) and are not shown in the view.
+Global settings such as the SSH host prefix, managed include path, session state directory, proxy auto-install, and SSH query config path live in VS Code Settings (`slurmConnect`). The view only shows the local proxy enable toggle; configure NO_PROXY, ports, and tunnel settings in Settings. The compute-node tunnel (`localProxyComputeTunnel`) forces proxy traffic through 127.0.0.1 on the compute node (helpful when `GatewayPorts` is disabled). Loopback targets (localhost/127.0.0.1/::1) are never proxied.
 
 ### Action bar
 - **Connect**: Creates the SSH host entry, opens Remote-SSH, and starts the allocation.

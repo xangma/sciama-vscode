@@ -139,6 +139,48 @@
           "default": [],
           "description": "Extra arguments appended to the proxy command."
         },
+        "slurmConnect.localProxyEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the built-in local HTTP(S) proxy for remote sessions."
+        },
+        "slurmConnect.localProxyNoProxy": {
+          "type": "array",
+          "default": [
+            "localhost",
+            "127.0.0.1"
+          ],
+          "description": "Hosts that should bypass the local proxy (NO_PROXY) on the remote side."
+        },
+        "slurmConnect.localProxyPort": {
+          "type": "number",
+          "default": 0,
+          "description": "Local proxy listen port (0 chooses a random available port)."
+        },
+        "slurmConnect.localProxyRemoteBind": {
+          "type": "string",
+          "default": "0.0.0.0",
+          "description": "Bind address for the login-host reverse tunnel."
+        },
+        "slurmConnect.localProxyRemoteHost": {
+          "type": "string",
+          "default": "",
+          "description": "Hostname or IP that compute nodes use to reach the login host proxy. Defaults to the selected login host."
+        },
+        "slurmConnect.localProxyComputeTunnel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Create a compute-node SSH tunnel to the login host proxy (needed when GatewayPorts is disabled)."
+        },
+        "slurmConnect.localProxyTunnelMode": {
+          "type": "string",
+          "enum": [
+            "remoteSsh",
+            "dedicated"
+          ],
+          "default": "remoteSsh",
+          "description": "How to expose the local proxy on the login host. remoteSsh uses the Remote-SSH connection (single SSH session; requires remote.SSH.useExecServer=false). dedicated opens a separate SSH reverse tunnel."
+        },
         "slurmConnect.extraSallocArgs": {
           "type": "array",
           "default": [],

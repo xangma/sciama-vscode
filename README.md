@@ -9,6 +9,7 @@ Key features:
 - Resource validation hints and profile support for repeatable runs.
 - Module picker with paste, chips, and clear-all.
 - Optional remote folder open + window targeting.
+- Optional local HTTP(S) proxy for outbound requests from compute nodes (proxies all non-loopback hosts).
 
 ## Requirements
 - VS Code with **Remote - SSH** installed.
@@ -24,7 +25,7 @@ Key features:
 
 The extension will query the login host, write a Slurm Connect SSH include file, ensure your SSH config contains a small Slurm Connect Include block (with a note), and connect. It does not replace your SSH config; it only adds the managed block. Local Slurm Connect logs are capped (currently 5 MB) to avoid unbounded growth.
 
-Profiles store the values you edit in the Slurm Connect view (connection, resources, and advanced fields). Global-only settings like the SSH host prefix, managed include path, session state directory, proxy auto-install, and SSH query config live in VS Code Settings under `slurmConnect`.
+Profiles store the values you edit in the Slurm Connect view (connection, resources, and advanced fields). The local proxy enable toggle is in the view; advanced local proxy settings and other global-only settings like the SSH host prefix, managed include path, session state directory, proxy auto-install, and SSH query config live in VS Code Settings under `slurmConnect`.
 
 ## Docs
 - Usage and UI reference: `docs/usage.md`

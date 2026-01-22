@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file based on git tag
 ## Unreleased
 _No unreleased changes._
 
+## 0.5.2 - 2026-01-22
+### Added
+- Built-in local HTTP(S) proxy for outbound access from compute nodes.
+- Local proxy enable toggle in the Advanced settings view.
+- Optional compute-node SSH tunnel for clusters with `GatewayPorts` disabled.
+
+### Changed
+- Compute-node tunnel toggle is settings-only (removed from the panel UI).
+- Advanced local proxy settings moved to VS Code Settings; the panel only shows the enable toggle.
+
+### Fixed
+- Proxy auto-install payload is compressed and prefers python3 (with gzip fallback).
+- Compute-node proxy tunnel setup is more robust (timeouts, shell wrapping, host key handling, better diagnostics).
+- Local proxy now blocks loopback (including IPv6-mapped), fixes IPv6 Host headers, and avoids port conflicts with retries/dedicated tunnels.
+- Remote-SSH exec-server downloads now inherit proxy env; proxy state persists and tunnels shut down on deactivation.
+- Added `slurmConnect.localProxyTunnelMode` for Remote-SSH vs dedicated tunneling.
+
+### Docs
+- Documented local proxy settings and usage guidance.
+
 ## 0.5.0 - 2026-01-20
 ### Added
 - Pre-SSH auth command hook with an optional check command to support interactive 2FA flows before SSH queries and Remote-SSH connects.

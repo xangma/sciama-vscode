@@ -7,6 +7,7 @@ export interface HostEntryConfig {
   forwardAgent?: boolean;
   identityFile?: string;
   additionalSshOptions?: Record<string, string>;
+  extraSshOptions?: string[];
 }
 
 export const SLURM_CONNECT_INCLUDE_START = '# >>> Slurm Connect (VS Code extension)';
@@ -84,6 +85,15 @@ export function buildHostEntry(
     if (value !== undefined && value !== null && String(value).length > 0) {
       lines.push(`  ${key} ${formatSshConfigValue(String(value))}`);
     }
+  }
+
+  const extraLines = cfg.extraSshOptions || [];
+  for (const line of extraLines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    lines.push(`  ${trimmed}`);
   }
 
   return `${lines.join('\n')}\n`;

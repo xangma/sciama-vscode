@@ -89,3 +89,32 @@ The "slurmConnect.proxyCommand" setting must execute it, e.g.:
 ```json
 "slurmConnect.proxyCommand": "python ~/.slurm-connect/vscode-proxy.py"
 ```
+
+## Local proxy for blocked outbound sites
+If compute/login nodes cannot reach a site but your local machine can, Slurm Connect can run a **built-in local HTTP(S) proxy** and expose it to the cluster via SSH. When enabled, the extension starts the proxy locally (no download required), exposes it on the login host, and sets `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` in the remote session.
+
+Example:
+```json
+"slurmConnect.localProxyEnabled": true,
+"slurmConnect.localProxyNoProxy": ["localhost", "127.0.0.1", ".cluster.local"],
+"slurmConnect.localProxyRemoteBind": "0.0.0.0",
+"slurmConnect.localProxyComputeTunnel": true
+```
+
+Notes:
+- The local proxy routes all non-loopback hosts; use `localProxyNoProxy` to bypass internal destinations.
+- Loopback targets like `localhost`, `127.0.0.1`, and `::1` are never proxied.
+- The proxy URL includes short-lived credentials to limit access. Slurm Connect redacts these in logs.
+- By default the proxy is exposed via the Remote-SSH connection (single SSH session). This requires `remote.SSH.useExecServer=false` so Remote-SSH does not open a second SSH connection.
+- If you need to avoid changing Remote-SSH settings, set `slurmConnect.localProxyTunnelMode` to `dedicated` to use a separate SSH reverse tunnel.
+- Compute nodes must be able to reach the login host bind address. If your SSH server disallows non-loopback remote forwards (`GatewayPorts`), enable the compute-node SSH tunnel (`slurmConnect.localProxyComputeTunnel`) so requests route through `127.0.0.1` on the compute node instead. The tunnel uses non-interactive SSH (host key checks disabled to avoid prompts).
+- If compute nodes cannot resolve the login host you connect to, set `slurmConnect.localProxyRemoteHost` to an internal hostname or IP they can resolve.
+
+### Compute-node proxy tunnel (slurmConnect.localProxyComputeTunnel)
+When enabled (default), Slurm Connect starts an SSH tunnel from the compute node back to the login host proxy:
+- The compute node connects to the login host and forwards `127.0.0.1:<random>` on the compute node to `127.0.0.1:<proxyPort>` on the login host.
+- Proxy environment variables on the compute node are set to `http://127.0.0.1:<localPort>` so tools (e.g. `curl`, `pip`) can reach the local proxy even when `GatewayPorts` is disabled.
+- SSH is non-interactive (`BatchMode=yes`) and disables host key checks to avoid blocking prompts; failures are logged in the Slurm Connect output.
+- The tunnel respects `slurmConnect.sshConnectTimeoutSeconds` (or `remote.SSH.connectTimeout` if you set it to 0).
+
+Disable it only if your compute nodes can directly reach the login-host bind address specified by `slurmConnect.localProxyRemoteBind`, and your SSH server allows those remote forwards.
