@@ -1845,22 +1845,25 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
             break;
           }
           const cfg = getConfig();
+          const aliasFromRemote = resolveRemoteSshAlias();
+          const aliasForSession = lastConnectionAlias || aliasFromRemote || '';
           const sessionKey =
             lastConnectionSessionKey ||
-            (lastConnectionAlias ? resolveSessionKey(cfg, lastConnectionAlias) : '');
+            (aliasForSession ? resolveSessionKey(cfg, aliasForSession) : '');
           let loginHost =
             lastConnectionLoginHost ||
             (cfg.loginHosts.length > 0 ? cfg.loginHosts[0] : undefined);
-          if (!loginHost && lastConnectionAlias) {
+          if (!loginHost && aliasForSession) {
             try {
-              const resolved = await resolveSshHostFromConfig(lastConnectionAlias, cfg);
+              const resolved = await resolveSshHostFromConfig(aliasForSession, cfg);
               loginHost = resolved.hostname || resolved.host || loginHost;
             } catch {
               // Ignore; we'll fall back to the existing value.
             }
           }
-          if (loginHost && sessionKey) {
-            await cancelPersistentSessionJob(loginHost, sessionKey, cfg, {
+          const isRemoteSession = vscode.env.remoteName === 'ssh-remote';
+          if (sessionKey && (loginHost || isRemoteSession)) {
+            await cancelPersistentSessionJob(loginHost || aliasForSession || 'remote', sessionKey, cfg, {
               useTerminal: true
             });
           } else {
@@ -3941,6 +3944,9 @@ async function createTerminalSshRunFiles(): Promise<{
 
 async function resolveLocalTerminalCwd(): Promise<string | undefined> {
   if (vscode.env.remoteName) {
+    if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+      return '~';
+    }
     return undefined;
   }
   const candidates: string[] = [];
