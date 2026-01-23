@@ -22,6 +22,7 @@ Key features:
 2. Open the **Slurm Connect** view from the activity bar.
 3. Select a login host (or pick from SSH config), username if needed, and an optional identity file.
 4. Click **Get cluster info**, choose resources, then **Connect**.
+   - While connecting, the button changes to **Cancel** so you can abort before Remote-SSH starts.
 
 The extension will query the login host, write a Slurm Connect SSH include file, ensure your SSH config contains a small Slurm Connect Include block (with a note), and connect. It does not replace your SSH config; it only adds the managed block. On Windows, the Include path stays in its configured form (default `~/.ssh/slurm-connect.conf`) for compatibility with both native and POSIX-style ssh clients. Local Slurm Connect logs are capped (currently 5 MB) to avoid unbounded growth.
 

@@ -90,6 +90,11 @@ type SessionMode = 'ephemeral' | 'persistent';
 type LocalProxyTunnelMode = 'remoteSsh' | 'dedicated';
 type SshHostKeyCheckingMode = 'accept-new' | 'ask' | 'yes' | 'no';
 
+interface ConnectToken {
+  id: number;
+  cancelled: boolean;
+}
+
 interface SessionSummary {
   sessionKey: string;
   jobId: string;
@@ -172,6 +177,8 @@ let lastConnectionAlias: string | undefined;
 let lastConnectionSessionKey: string | undefined;
 let lastConnectionSessionMode: SessionMode | undefined;
 let lastConnectionLoginHost: string | undefined;
+let activeConnectToken: ConnectToken | undefined;
+let connectTokenCounter = 0;
 let lastSshAuthPrompt: { identityPath: string; timestamp: number; mode: SshAuthMode } | undefined;
 let preSshCommandInFlight: Promise<void> | undefined;
 let logWriteQueue: Promise<void> = Promise.resolve();
@@ -1145,6 +1152,7 @@ async function refreshAgentStatus(identityFile: string): Promise<void> {
   }
   const agentStatus = await buildAgentStatusMessage(identityFile);
   postToWebview({
+    command: 'agentStatus',
     agentStatus: agentStatus.text,
     agentStatusError: agentStatus.isError
   });
@@ -1157,6 +1165,29 @@ function setConnectionState(state: ConnectionState): void {
     state,
     sessionMode: lastConnectionSessionMode
   });
+}
+
+function createConnectToken(): ConnectToken {
+  const token = { id: connectTokenCounter + 1, cancelled: false };
+  connectTokenCounter += 1;
+  activeConnectToken = token;
+  return token;
+}
+
+function cancelActiveConnectToken(): void {
+  if (activeConnectToken) {
+    activeConnectToken.cancelled = true;
+  }
+}
+
+function isConnectCancelled(token?: ConnectToken): boolean {
+  return Boolean(token?.cancelled);
+}
+
+function finalizeConnectToken(token?: ConnectToken): void {
+  if (token && activeConnectToken === token) {
+    activeConnectToken = undefined;
+  }
 }
 
 function resolveRemoteSshAlias(): string | undefined {
@@ -1698,17 +1729,36 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
           const sessionSelection =
             typeof message.sessionSelection === 'string' ? message.sessionSelection.trim() : '';
           await updateConfigFromUi(uiValues, target);
+          if (connectionState === 'connecting' && activeConnectToken && !activeConnectToken.cancelled) {
+            break;
+          }
+          const token = createConnectToken();
           setConnectionState('connecting');
           const overrides = buildOverridesFromUi(uiValues);
           if (sessionSelection) {
             overrides.sessionMode = 'persistent';
             overrides.sessionKey = sessionSelection;
           }
-          const connected = await connectCommand(overrides, {
-            interactive: false,
-            aliasOverride: sessionSelection
-          });
-          setConnectionState(connected ? 'connected' : 'idle');
+          let connected = false;
+          try {
+            connected = await connectCommand(overrides, {
+              interactive: false,
+              aliasOverride: sessionSelection,
+              token
+            });
+          } catch (error) {
+            getOutputChannel().appendLine(`Connect failed: ${formatError(error)}`);
+          }
+          if (!isConnectCancelled(token)) {
+            setConnectionState(connected ? 'connected' : 'idle');
+          }
+          finalizeConnectToken(token);
+          break;
+        }
+        case 'cancelConnect': {
+          cancelActiveConnectToken();
+          stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: false });
+          setConnectionState('idle');
           break;
         }
         case 'saveSettings': {
@@ -1996,18 +2046,35 @@ class SlurmConnectViewProvider implements vscode.WebviewViewProvider {
 
 async function connectCommand(
   overrides?: Partial<SlurmConnectConfig>,
-  options?: { interactive?: boolean; aliasOverride?: string }
+  options?: { interactive?: boolean; aliasOverride?: string; token?: ConnectToken }
 ): Promise<boolean> {
   const cfg = getConfigWithOverrides(overrides);
   const interactive = options?.interactive !== false;
+  const connectToken = options?.token;
   const log = getOutputChannel();
   log.clear();
   log.appendLine('Slurm Connect started.');
 
   let didConnect = false;
+  const wasCancelled = (): boolean => isConnectCancelled(connectToken);
+  const cancelAndReturn = (): boolean => {
+    if (!wasCancelled()) {
+      return false;
+    }
+    log.appendLine('Connect cancelled by user.');
+    stopLocalProxyServer({ stopTunnel: true, clearRuntimeState: false });
+    return true;
+  };
+
+  if (wasCancelled()) {
+    return false;
+  }
 
   const loginHosts = await resolveLoginHosts(cfg, { interactive });
   log.appendLine(`Login hosts resolved: ${loginHosts.join(', ') || '(none)'}`);
+  if (cancelAndReturn()) {
+    return false;
+  }
   if (loginHosts.length === 0) {
     void vscode.window.showErrorMessage('No login hosts available. Configure slurmConnect.loginHosts or loginHostsCommand.');
     return false;
@@ -2025,9 +2092,15 @@ async function connectCommand(
   if (!loginHost) {
     return false;
   }
+  if (cancelAndReturn()) {
+    return false;
+  }
 
   const proceed = await maybePromptForSshAuthOnConnect(cfg, loginHost);
   if (!proceed) {
+    return false;
+  }
+  if (cancelAndReturn()) {
     return false;
   }
 
@@ -2053,12 +2126,18 @@ async function connectCommand(
       return false;
     }
     partition = partitionPick;
+    if (cancelAndReturn()) {
+      return false;
+    }
 
     qos = await pickOptionalValue('Select QoS (optional)', await querySimpleList(loginHost, cfg, cfg.qosCommand));
     account = await pickOptionalValue(
       'Select account (optional)',
       await querySimpleList(loginHost, cfg, cfg.accountCommand)
     );
+    if (cancelAndReturn()) {
+      return false;
+    }
   } else {
     partition = cfg.defaultPartition || undefined;
   }
@@ -2077,24 +2156,36 @@ async function connectCommand(
       return false;
     }
     nodes = nodesInput;
+    if (cancelAndReturn()) {
+      return false;
+    }
 
     const tasksInput = await promptNumber('Tasks per node', cfg.defaultTasksPerNode, 1);
     if (tasksInput === undefined) {
       return false;
     }
     tasksPerNode = tasksInput;
+    if (cancelAndReturn()) {
+      return false;
+    }
 
     const cpusInput = await promptNumber('CPUs per task', cfg.defaultCpusPerTask, 1);
     if (cpusInput === undefined) {
       return false;
     }
     cpusPerTask = cpusInput;
+    if (cancelAndReturn()) {
+      return false;
+    }
 
     const timeInput = await promptTime('Wall time', cfg.defaultTime || '24:00:00');
     if (timeInput === undefined) {
       return false;
     }
     time = timeInput;
+    if (cancelAndReturn()) {
+      return false;
+    }
   }
 
   if (!partition || partition.trim().length === 0) {
@@ -2103,6 +2194,9 @@ async function connectCommand(
       partition = resolvedPartition;
       log.appendLine(`Using default partition: ${partition}`);
     }
+  }
+  if (cancelAndReturn()) {
+    return false;
   }
 
   if (!time || time.trim().length === 0) {
@@ -2115,6 +2209,9 @@ async function connectCommand(
       log.appendLine(`No partition default time found; using fallback wall time: ${time}`);
     }
   }
+  if (cancelAndReturn()) {
+    return false;
+  }
 
   let extraArgs: string[] = [];
   if (interactive && cfg.promptForExtraSallocArgs) {
@@ -2126,6 +2223,9 @@ async function connectCommand(
     if (extra && extra.trim().length > 0) {
       extraArgs = splitArgs(extra.trim());
     }
+  }
+  if (cancelAndReturn()) {
+    return false;
   }
 
   const sallocArgs = buildSallocArgs({
@@ -2156,6 +2256,9 @@ async function connectCommand(
     }
     alias = aliasInput.trim();
   }
+  if (cancelAndReturn()) {
+    return false;
+  }
   if (!alias) {
     alias = defaultAlias;
   }
@@ -2172,7 +2275,13 @@ async function connectCommand(
   let localProxyPlan: LocalProxyPlan = { enabled: false };
 
   await ensureRemoteSshSettings(cfg);
+  if (cancelAndReturn()) {
+    return false;
+  }
   await migrateStaleRemoteSshConfigIfNeeded();
+  if (cancelAndReturn()) {
+    return false;
+  }
   const remoteCfg = vscode.workspace.getConfiguration('remote.SSH');
   const currentRemoteConfig = normalizeRemoteConfigPath(remoteCfg.get<string>('configFile'));
   const baseConfigPath = normalizeSshPath(currentRemoteConfig || defaultSshConfigPath());
@@ -2191,18 +2300,29 @@ async function connectCommand(
     void vscode.window.showErrorMessage(message);
     return false;
   }
+  if (cancelAndReturn()) {
+    return false;
+  }
 
   let preSshReady = false;
   let connected = false;
   for (let attempt = 0; attempt < maxProxyPortAttempts; attempt += 1) {
+    if (cancelAndReturn()) {
+      return false;
+    }
     const overridePort =
       shouldRetryProxyPort && proxyPortCandidates.length > 0 ? proxyPortCandidates[attempt] : undefined;
     try {
       localProxyPlan = await ensureLocalProxyPlan(cfg, loginHost, { remotePortOverride: overridePort });
     } catch (error) {
-      const message = `Failed to start local proxy: ${formatError(error)}`;
-      log.appendLine(message);
-      void vscode.window.showErrorMessage(message);
+      if (!wasCancelled()) {
+        const message = `Failed to start local proxy: ${formatError(error)}`;
+        log.appendLine(message);
+        void vscode.window.showErrorMessage(message);
+      }
+      return false;
+    }
+    if (cancelAndReturn()) {
       return false;
     }
     if (shouldRetryProxyPort && proxyPortCandidates.length === 0) {
@@ -2223,7 +2343,12 @@ async function connectCommand(
       localProxyPlan
     );
     if (!remoteCommand) {
-      void vscode.window.showErrorMessage('RemoteCommand is empty. Check slurmConnect.proxyCommand.');
+      if (!wasCancelled()) {
+        void vscode.window.showErrorMessage('RemoteCommand is empty. Check slurmConnect.proxyCommand.');
+      }
+      return false;
+    }
+    if (cancelAndReturn()) {
       return false;
     }
 
@@ -2241,24 +2366,37 @@ async function connectCommand(
       const status = await ensureSshIncludeInstalled(baseConfigPath, includePath);
       log.appendLine(`SSH config include ${status} in ${baseConfigPath}.`);
     } catch (error) {
-      const message = `Failed to install SSH Include block: ${formatError(error)}`;
-      log.appendLine(message);
-      void vscode.window.showErrorMessage(message);
+      if (!wasCancelled()) {
+        const message = `Failed to install SSH Include block: ${formatError(error)}`;
+        log.appendLine(message);
+        void vscode.window.showErrorMessage(message);
+      }
+      return false;
+    }
+    if (cancelAndReturn()) {
       return false;
     }
     await delay(300);
     await refreshRemoteSshHosts();
+    if (cancelAndReturn()) {
+      return false;
+    }
 
     if (!preSshReady) {
       try {
         await ensurePreSshCommand(cfg, `Remote-SSH connect to ${alias.trim()}`);
       } catch (error) {
-        const message = `Pre-SSH command failed: ${formatError(error)}`;
-        log.appendLine(message);
-        void vscode.window.showErrorMessage(message);
+        if (!wasCancelled()) {
+          const message = `Pre-SSH command failed: ${formatError(error)}`;
+          log.appendLine(message);
+          void vscode.window.showErrorMessage(message);
+        }
         return false;
       }
       preSshReady = true;
+    }
+    if (cancelAndReturn()) {
+      return false;
     }
 
     connected = await connectToHost(
@@ -2266,6 +2404,9 @@ async function connectCommand(
       cfg.openInNewWindow,
       cfg.remoteWorkspacePath
     );
+    if (cancelAndReturn()) {
+      return false;
+    }
     if (connected) {
       break;
     }
@@ -2288,14 +2429,16 @@ async function connectCommand(
     lastConnectionLoginHost = undefined;
   }
   if (!connected) {
-    void vscode.window.showWarningMessage(
-      `SSH host "${alias.trim()}" created, but auto-connect failed. Use Remote-SSH to connect.`,
-      'Show Output'
-    ).then((selection) => {
-      if (selection === 'Show Output') {
-        getOutputChannel().show(true);
-      }
-    });
+    if (!wasCancelled()) {
+      void vscode.window.showWarningMessage(
+        `SSH host "${alias.trim()}" created, but auto-connect failed. Use Remote-SSH to connect.`,
+        'Show Output'
+      ).then((selection) => {
+        if (selection === 'Show Output') {
+          getOutputChannel().show(true);
+        }
+      });
+    }
     return didConnect;
   }
   if (cfg.openInNewWindow) {
@@ -8749,8 +8892,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       let disabled = false;
       let statusText = '';
       if (connectionState === 'connecting') {
-        label = 'Connecting...';
-        disabled = true;
+        label = 'Cancel';
         statusText = 'Connecting...';
       } else if (connectionState === 'connected') {
         label = 'Disconnect';
@@ -10850,6 +10992,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
     });
 
     document.getElementById('connectToggle').addEventListener('click', () => {
+      if (connectionState === 'connecting') {
+        setConnectState('idle');
+        vscode.postMessage({ command: 'cancelConnect' });
+        return;
+      }
       if (connectionState === 'connected') {
         setConnectState('disconnecting');
         vscode.postMessage({ command: 'disconnect' });
