@@ -3353,6 +3353,13 @@ function normalizeSshErrorText(error: unknown): string {
   return String(error);
 }
 
+function getSshAgentEnv(): { sock: string; pid: string } {
+  return {
+    sock: process.env.SSH_AUTH_SOCK || '',
+    pid: process.env.SSH_AGENT_PID || ''
+  };
+}
+
 type SshToolName = 'ssh' | 'ssh-add' | 'ssh-keygen';
 const sshToolPathCache: Partial<Record<SshToolName, string>> = {};
 
@@ -3734,6 +3741,18 @@ async function getSshAgentPublicKeys(): Promise<Array<{ type: string; key: strin
   }
 }
 
+function countAgentKeys(output: string): number {
+  if (!output.trim()) {
+    return 0;
+  }
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .filter((line) => /sha256:|md5:/i.test(line))
+    .length;
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -3808,6 +3827,9 @@ async function isSshKeyListedInAgentOutput(identityPath: string, output: string)
       return true;
     }
   }
+  if (!pubTokens && countAgentKeys(output) > 0) {
+    return true;
+  }
   return false;
 }
 
@@ -3859,6 +3881,7 @@ async function runSshAddInTerminal(identityPath: string): Promise<void> {
   const trimmed = identityPath.trim();
   const args = trimmed ? [trimmed] : [];
   const { dirPath, stdoutPath, statusPath } = await createTerminalSshRunFiles();
+  const agentEnv = getSshAgentEnv();
   const isWindows = process.platform === 'win32';
   const shellCommand = isWindows
     ? (() => {
@@ -3868,6 +3891,8 @@ async function runSshAddInTerminal(identityPath: string): Promise<void> {
           `$stdoutPath = ${quotePowerShellString(stdoutPath)}`,
           `$statusPath = ${quotePowerShellString(statusPath)}`,
           `$cmd = ${quotePowerShellString(sshAdd)}`,
+          `$env:SSH_AUTH_SOCK = ${quotePowerShellString(agentEnv.sock)}`,
+          `$env:SSH_AGENT_PID = ${quotePowerShellString(agentEnv.pid)}`,
           psArgs ? `$cmdArgs = @(${psArgs})` : '$cmdArgs = @()',
           '$exitCode = 1',
           'try {',
@@ -3882,8 +3907,9 @@ async function runSshAddInTerminal(identityPath: string): Promise<void> {
         return `powershell -NoProfile -EncodedCommand ${encoded}`;
       })()
     : (() => {
+        const envPrefix = `SSH_AUTH_SOCK=${quoteShellArg(agentEnv.sock)} SSH_AGENT_PID=${quoteShellArg(agentEnv.pid)}`;
         const sshCommand = [quoteShellArg(sshAdd), ...args.map(quoteShellArg)].join(' ');
-        return `${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
+        return `${envPrefix} ${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
       })();
 
   const terminal = vscode.window.createTerminal({ name: 'Slurm Connect SSH Add' });
