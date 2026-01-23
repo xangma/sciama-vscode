@@ -3687,6 +3687,53 @@ async function getPublicKeyFingerprint(identityPath: string): Promise<string | u
   }
 }
 
+function parsePublicKeyTokens(line: string): { type: string; key: string } | undefined {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const parts = trimmed.split(/\s+/);
+  if (parts.length < 2) {
+    return undefined;
+  }
+  const [type, key] = parts;
+  if (!type || !key) {
+    return undefined;
+  }
+  return { type, key };
+}
+
+async function readPublicKeyTokens(identityPath: string): Promise<{ type: string; key: string } | undefined> {
+  const pubPath = identityPath.endsWith('.pub') ? identityPath : `${identityPath}.pub`;
+  try {
+    const text = await fs.readFile(pubPath, 'utf8');
+    const line = text
+      .split(/\r?\n/)
+      .map((entry) => entry.trim())
+      .find((entry) => entry.length > 0);
+    return line ? parsePublicKeyTokens(line) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function getSshAgentPublicKeys(): Promise<Array<{ type: string; key: string }>> {
+  try {
+    const sshAdd = await resolveSshToolPath('ssh-add');
+    const result = await execFileAsync(sshAdd, ['-L']);
+    const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
+    if (!output.trim() || /no identities/i.test(output)) {
+      return [];
+    }
+    return output
+      .split(/\r?\n/)
+      .map((line) => parsePublicKeyTokens(line))
+      .filter((entry): entry is { type: string; key: string } => Boolean(entry));
+  } catch {
+    return [];
+  }
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -3753,6 +3800,13 @@ async function isSshKeyListedInAgentOutput(identityPath: string, output: string)
   }
   if (output.includes(identityPath)) {
     return true;
+  }
+  const pubTokens = await readPublicKeyTokens(identityPath);
+  if (pubTokens) {
+    const agentKeys = await getSshAgentPublicKeys();
+    if (agentKeys.some((entry) => entry.type === pubTokens.type && entry.key === pubTokens.key)) {
+      return true;
+    }
   }
   return false;
 }
