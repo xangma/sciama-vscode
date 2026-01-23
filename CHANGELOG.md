@@ -2,7 +2,13 @@
 All notable changes to this project are documented in this file based on git tags and commit history.
 
 ## Unreleased
-_No unreleased changes._
+### Fixed
+- Windows: keep the managed SSH Include path in its configured form (default `~/.ssh/slurm-connect.conf`) so POSIX-style ssh clients do not misinterpret absolute `C:\...` paths.
+- Windows: always offer to persist `remote.SSH.useLocalServer=true` in user settings even when the UI default appears enabled.
+- Windows: `ssh-add` now completes reliably by running in a terminal and waiting on its exit status (avoids agent detection mismatches).
+
+### Added
+- Added `slurmConnect.sshHostKeyChecking` (default `accept-new`) to control host key checking for non-interactive SSH queries and proxy tunnels.
 
 ## 0.5.2 - 2026-01-22
 ### Added

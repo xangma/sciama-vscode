@@ -4,7 +4,7 @@ All settings live under the `slurmConnect` namespace.
 
 ## Profiles vs global
 - The Slurm Connect view saves its form values into profiles. Editing the UI no longer writes those values back to settings.
-- Global-only settings stay in VS Code settings and are not shown in the view: `sshHostPrefix`, `temporarySshConfigPath`, `sshQueryConfigPath`, `sessionStateDir`, `autoInstallProxyScriptOnClusterInfo`, and `sshConnectTimeoutSeconds` (plus `proxyCommand`/`proxyArgs`). The view only shows the local proxy enable toggle; advanced local proxy settings stay in VS Code settings.
+- Global-only settings stay in VS Code settings and are not shown in the view: `sshHostPrefix`, `temporarySshConfigPath`, `sshQueryConfigPath`, `sshHostKeyChecking`, `sessionStateDir`, `autoInstallProxyScriptOnClusterInfo`, and `sshConnectTimeoutSeconds` (plus `proxyCommand`/`proxyArgs`). The view only shows the local proxy enable toggle; advanced local proxy settings stay in VS Code settings.
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -50,9 +50,10 @@ All settings live under the `slurmConnect` namespace.
 | `slurmConnect.sshHostPrefix` | string | `"slurm"` | Prefix for generated SSH host aliases. |
 | `slurmConnect.openInNewWindow` | boolean | `false` | Open the Remote-SSH connection in a new window. |
 | `slurmConnect.remoteWorkspacePath` | string | `""` | Remote folder to open after connecting (e.g. /home/user/project). Leave blank to just connect. |
-| `slurmConnect.temporarySshConfigPath` | string | `"~/.ssh/slurm-connect.conf"` | Path for the Slurm Connect SSH include file. The extension installs a small Include block (with a note) in your SSH config that points here. |
+| `slurmConnect.temporarySshConfigPath` | string | `"~/.ssh/slurm-connect.conf"` | Path for the Slurm Connect SSH include file. The extension installs a small Include block (with a note) in your SSH config that points here. On Windows, prefer the `~/.ssh/...` form for compatibility with POSIX-style ssh clients. |
 | `slurmConnect.additionalSshOptions` | object | `{}` | Additional SSH config options to include in generated host entries. |
 | `slurmConnect.sshQueryConfigPath` | string | `""` | Optional SSH config path to use when querying the cluster. |
+| `slurmConnect.sshHostKeyChecking` | string | `"accept-new"` | StrictHostKeyChecking value for non-interactive SSH queries (cluster info, login host discovery, proxy tunnels). |
 | `slurmConnect.sshConnectTimeoutSeconds` | number | `15` | Timeout for SSH resource queries and proxy tunnel setup in seconds. |
 
 ## Notes

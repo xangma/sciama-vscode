@@ -75,6 +75,7 @@ interface SlurmConnectConfig {
   temporarySshConfigPath: string;
   additionalSshOptions: Record<string, string>;
   sshQueryConfigPath: string;
+  sshHostKeyChecking: SshHostKeyCheckingMode;
   sshConnectTimeoutSeconds: number;
 }
 
@@ -87,6 +88,7 @@ type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
 type SshAuthMode = 'agent' | 'terminal';
 type SessionMode = 'ephemeral' | 'persistent';
 type LocalProxyTunnelMode = 'remoteSsh' | 'dedicated';
+type SshHostKeyCheckingMode = 'accept-new' | 'ask' | 'yes' | 'no';
 
 interface SessionSummary {
   sessionKey: string;
@@ -241,6 +243,7 @@ const CONFIG_KEYS = [
   'temporarySshConfigPath',
   'additionalSshOptions',
   'sshQueryConfigPath',
+  'sshHostKeyChecking',
   'sshConnectTimeoutSeconds'
 ];
 const CLUSTER_SETTING_KEYS = [
@@ -1544,6 +1547,7 @@ function getConfigFromSettings(): SlurmConnectConfig {
     temporarySshConfigPath: (cfg.get<string>('temporarySshConfigPath') || '').trim(),
     additionalSshOptions: cfg.get<Record<string, string>>('additionalSshOptions', {}),
     sshQueryConfigPath: (cfg.get<string>('sshQueryConfigPath') || '').trim(),
+    sshHostKeyChecking: normalizeSshHostKeyChecking(cfg.get<string>('sshHostKeyChecking') || 'accept-new'),
     sshConnectTimeoutSeconds: cfg.get<number>('sshConnectTimeoutSeconds', 15)
   };
 }
@@ -1604,6 +1608,7 @@ function getConfigDefaultsFromSettings(): SlurmConnectConfig {
     temporarySshConfigPath: String(getDefault<string>('temporarySshConfigPath', '') || '').trim(),
     additionalSshOptions: getDefault<Record<string, string>>('additionalSshOptions', {}),
     sshQueryConfigPath: String(getDefault<string>('sshQueryConfigPath', '') || '').trim(),
+    sshHostKeyChecking: normalizeSshHostKeyChecking(String(getDefault<string>('sshHostKeyChecking', 'accept-new') || 'accept-new')),
     sshConnectTimeoutSeconds: Number(getDefault<number>('sshConnectTimeoutSeconds', 15))
   };
 }
@@ -2179,7 +2184,8 @@ async function connectCommand(
     }
   }
   const includePath = resolveSlurmConnectIncludePath(cfg);
-  if (normalizeSshPath(includePath) === normalizeSshPath(baseConfigPath)) {
+  const includeFilePath = resolveSlurmConnectIncludeFilePath(cfg);
+  if (normalizeSshPath(baseConfigPath) === includeFilePath) {
     const message = 'Slurm Connect include file path must not be the same as the SSH config path.';
     log.appendLine(message);
     void vscode.window.showErrorMessage(message);
@@ -2231,7 +2237,7 @@ async function connectCommand(
     log.appendLine(redactRemoteCommandForLog(hostEntry));
 
     try {
-      await writeSlurmConnectIncludeFile(hostEntry, includePath);
+      await writeSlurmConnectIncludeFile(hostEntry, includeFilePath);
       const status = await ensureSshIncludeInstalled(baseConfigPath, includePath);
       log.appendLine(`SSH config include ${status} in ${baseConfigPath}.`);
     } catch (error) {
@@ -3204,6 +3210,52 @@ function normalizeSshErrorText(error: unknown): string {
   return String(error);
 }
 
+type SshToolName = 'ssh' | 'ssh-add' | 'ssh-keygen';
+const sshToolPathCache: Partial<Record<SshToolName, string>> = {};
+
+async function resolveSshToolPath(tool: SshToolName): Promise<string> {
+  const cached = sshToolPathCache[tool];
+  if (cached) {
+    return cached;
+  }
+  if (process.platform !== 'win32') {
+    sshToolPathCache[tool] = tool;
+    return tool;
+  }
+
+  const resolveWithWhere = async (name: string): Promise<string | undefined> => {
+    try {
+      const { stdout } = await execFileAsync('where', [name]);
+      const first = stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)[0];
+      return first || undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const sshPath = sshToolPathCache.ssh || (await resolveWithWhere('ssh'));
+  if (sshPath) {
+    sshToolPathCache.ssh = sshPath;
+    const candidate = path.join(path.dirname(sshPath), `${tool}.exe`);
+    if (await fileExists(candidate)) {
+      sshToolPathCache[tool] = candidate;
+      return candidate;
+    }
+  }
+
+  const resolved = await resolveWithWhere(tool);
+  if (resolved) {
+    sshToolPathCache[tool] = resolved;
+    return resolved;
+  }
+
+  sshToolPathCache[tool] = tool;
+  return tool;
+}
+
 function pickSshErrorSummary(text: string): string {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   if (lines.length === 0) {
@@ -3237,6 +3289,11 @@ function looksLikeAuthFailure(text: string): boolean {
   ].some((pattern) => pattern.test(text));
 }
 
+function appendSshHostKeyCheckingArgs(args: string[], cfg: SlurmConnectConfig): void {
+  const mode = normalizeSshHostKeyChecking(cfg.sshHostKeyChecking);
+  args.push('-o', `StrictHostKeyChecking=${mode}`);
+}
+
 function buildSshArgs(
   host: string,
   cfg: SlurmConnectConfig,
@@ -3248,6 +3305,7 @@ function buildSshArgs(
     args.push('-F', expandHome(cfg.sshQueryConfigPath));
   }
   args.push('-T', '-o', `BatchMode=${options.batchMode ? 'yes' : 'no'}`, '-o', `ConnectTimeout=${cfg.sshConnectTimeoutSeconds}`);
+  appendSshHostKeyCheckingArgs(args, cfg);
   if (cfg.identityFile) {
     args.push('-i', expandHome(cfg.identityFile));
   }
@@ -3477,7 +3535,8 @@ async function getPublicKeyFingerprint(identityPath: string): Promise<string | u
     return undefined;
   }
   try {
-    const { stdout } = await execFileAsync('ssh-keygen', ['-lf', pubPath, '-E', 'sha256']);
+    const sshKeygen = await resolveSshToolPath('ssh-keygen');
+    const { stdout } = await execFileAsync(sshKeygen, ['-lf', pubPath, '-E', 'sha256']);
     const match = stdout.match(/SHA256:[A-Za-z0-9+/=]+/);
     return match ? match[0] : undefined;
   } catch {
@@ -3508,7 +3567,8 @@ function looksLikeAgentUnavailable(text: string): boolean {
 
 async function getSshAgentInfo(): Promise<SshAgentInfo> {
   try {
-    const result = await execFileAsync('ssh-add', ['-l']);
+    const sshAdd = await resolveSshToolPath('ssh-add');
+    const result = await execFileAsync(sshAdd, ['-l']);
     const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
     if (!output.trim() || /no identities/i.test(output)) {
       return { status: 'empty', output };
@@ -3597,40 +3657,60 @@ async function isSshKeyLoaded(identityPath: string): Promise<boolean> {
 }
 
 
-function buildTerminalSshAddCommand(identityPath: string): string {
+async function runSshAddInTerminal(identityPath: string): Promise<void> {
+  const sshAdd = await resolveSshToolPath('ssh-add');
   const trimmed = identityPath.trim();
-  if (!trimmed) {
-    return 'ssh-add';
-  }
-  if (!/[\s"]/g.test(trimmed)) {
-    return `ssh-add ${trimmed}`;
-  }
-  const escaped = trimmed.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  return `ssh-add "${escaped}"`;
-}
+  const args = trimmed ? [trimmed] : [];
+  const { dirPath, stdoutPath, statusPath } = await createTerminalSshRunFiles();
+  const isWindows = process.platform === 'win32';
+  const shellCommand = isWindows
+    ? (() => {
+        const psArgs = args.map((arg) => quotePowerShellString(arg)).join(', ');
+        const psScript = [
+          "$ErrorActionPreference = 'Continue'",
+          `$stdoutPath = ${quotePowerShellString(stdoutPath)}`,
+          `$statusPath = ${quotePowerShellString(statusPath)}`,
+          `$cmd = ${quotePowerShellString(sshAdd)}`,
+          psArgs ? `$cmdArgs = @(${psArgs})` : '$cmdArgs = @()',
+          '$exitCode = 1',
+          'try {',
+          '  & $cmd @cmdArgs | Out-File -FilePath $stdoutPath -Encoding utf8',
+          '  $exitCode = $LASTEXITCODE',
+          '} catch {',
+          '  $exitCode = 1',
+          '}',
+          '$exitCode | Out-File -FilePath $statusPath -Encoding ascii -NoNewline'
+        ].join('; ');
+        const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+        return `powershell -NoProfile -EncodedCommand ${encoded}`;
+      })()
+    : (() => {
+        const sshCommand = [quoteShellArg(sshAdd), ...args.map(quoteShellArg)].join(' ');
+        return `${sshCommand} > ${quoteShellArg(stdoutPath)}; printf "%s" $? > ${quoteShellArg(statusPath)}`;
+      })();
 
-function openSshAddTerminal(identityPath: string): vscode.Terminal {
   const terminal = vscode.window.createTerminal({ name: 'Slurm Connect SSH Add' });
   terminal.show(true);
-  const command = buildTerminalSshAddCommand(identityPath);
-  terminal.sendText(command, true);
+  terminal.sendText(shellCommand, true);
   void vscode.window.showInformationMessage('Follow the terminal prompt to add your SSH key with ssh-add.');
-  return terminal;
-}
 
-async function waitForSshKeyLoaded(
-  identityPath: string,
-  timeoutMs: number,
-  pollMs: number
-): Promise<boolean> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (await isSshKeyLoaded(identityPath)) {
-      return true;
+  let exitCode = NaN;
+  try {
+    await waitForFile(statusPath, 500);
+    const statusText = await fs.readFile(statusPath, 'utf8');
+    exitCode = Number(statusText.trim());
+  } finally {
+    try {
+      await fs.rm(dirPath, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup failures.
     }
-    await delay(pollMs);
   }
-  return await isSshKeyLoaded(identityPath);
+
+  if (!Number.isFinite(exitCode) || exitCode !== 0) {
+    throw new Error('ssh-add failed in the terminal. Check the terminal output for details.');
+  }
+  terminal.dispose();
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -3710,24 +3790,21 @@ async function maybePromptForSshAuth(
     return { kind: 'terminal' };
   }
   if (choice === 'Add to Agent' && identityPath && canAddToAgent) {
-    const terminal = openSshAddTerminal(identityPath);
-    const loaded = await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: 'Waiting for ssh-add to load the key',
-        cancellable: false
-      },
-      async () => await waitForSshKeyLoaded(identityPath, 180_000, 1500)
-    );
-    if (loaded) {
-      terminal.dispose();
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Waiting for ssh-add to complete',
+          cancellable: false
+        },
+        async () => await runSshAddInTerminal(identityPath)
+      );
       await refreshAgentStatus(cfg.identityFile);
       return { kind: 'agent' };
+    } catch (error) {
+      void vscode.window.showWarningMessage(`ssh-add failed: ${formatError(error)}`);
+      return undefined;
     }
-    void vscode.window.showInformationMessage(
-      'SSH key not detected in agent yet. Re-run Get cluster info after ssh-add completes.'
-    );
-    return undefined;
   }
   if (choice === 'Open Slurm Connect') {
     await openSlurmConnectView();
@@ -3782,22 +3859,18 @@ async function maybePromptForSshAuthOnConnect(cfg: SlurmConnectConfig, loginHost
   lastSshAuthPrompt = { identityPath, timestamp: now, mode };
 
   if (choice === 'Add to Agent' && canAddToAgent) {
-    const terminal = openSshAddTerminal(identityPath);
-    const loaded = await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: 'Waiting for ssh-add to load the key',
-        cancellable: false
-      },
-      async () => await waitForSshKeyLoaded(identityPath, 180_000, 1500)
-    );
-    if (loaded) {
-      terminal.dispose();
-      await refreshAgentStatus(cfg.identityFile);
-    } else {
-      void vscode.window.showInformationMessage(
-        'SSH key not detected in agent yet. Continue once ssh-add completes.'
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Waiting for ssh-add to complete',
+          cancellable: false
+        },
+        async () => await runSshAddInTerminal(identityPath)
       );
+      await refreshAgentStatus(cfg.identityFile);
+    } catch (error) {
+      void vscode.window.showWarningMessage(`ssh-add failed: ${formatError(error)}`);
     }
     return true;
   }
@@ -5191,6 +5264,7 @@ async function checkLocalProxyTunnel(state: LocalProxyTunnelState, cfg: SlurmCon
   }
   args.push('-S', state.controlPath, '-O', 'check');
   args.push('-o', 'BatchMode=yes', '-o', `ConnectTimeout=${cfg.sshConnectTimeoutSeconds}`);
+  appendSshHostKeyCheckingArgs(args, cfg);
   if (cfg.identityFile) {
     args.push('-i', expandHome(cfg.identityFile));
   }
@@ -5231,6 +5305,7 @@ function buildLocalProxyTunnelArgs(
   args.push('-N', '-f');
   args.push('-o', 'BatchMode=yes');
   args.push('-o', `ConnectTimeout=${cfg.sshConnectTimeoutSeconds}`);
+  appendSshHostKeyCheckingArgs(args, cfg);
   args.push('-o', 'ExitOnForwardFailure=yes');
   args.push('-o', 'ServerAliveInterval=30');
   args.push('-o', 'ServerAliveCountMax=3');
@@ -5846,10 +5921,11 @@ function defaultSshConfigPath(): string {
 
 function resolveSlurmConnectIncludePath(cfg: SlurmConnectConfig): string {
   const trimmed = (cfg.temporarySshConfigPath || '').trim();
-  if (trimmed) {
-    return normalizeSshPath(trimmed);
-  }
-  return path.join(os.homedir(), '.ssh', 'slurm-connect.conf');
+  return trimmed || '~/.ssh/slurm-connect.conf';
+}
+
+function resolveSlurmConnectIncludeFilePath(cfg: SlurmConnectConfig): string {
+  return normalizeSshPath(resolveSlurmConnectIncludePath(cfg));
 }
 
 function normalizeSshPath(value: string): string {
@@ -6622,14 +6698,12 @@ async function ensureLocalServerSetting(): Promise<void> {
       );
       return;
     }
-    if (useLocalServer) {
-      return;
-    }
+    let hasKey = false;
     try {
-      const hasKey = await userSettingsHasKey(settingsPath, 'remote.SSH.useLocalServer');
+      hasKey = await userSettingsHasKey(settingsPath, 'remote.SSH.useLocalServer');
       if (!hasKey) {
         const action = await vscode.window.showInformationMessage(
-          `Slurm Connect detected ${platform} (${osVersion}). To work around a Remote-SSH issue, it can add "remote.SSH.useLocalServer": true to ${settingsPath}.`,
+          `Slurm Connect detected ${platform} (${osVersion}). To work around a Remote-SSH issue, it can add "remote.SSH.useLocalServer": true to ${settingsPath} (required even if the UI shows it enabled).`,
           'Add Setting',
           'Not Now'
         );
@@ -6649,6 +6723,10 @@ async function ensureLocalServerSetting(): Promise<void> {
       void vscode.window.showWarningMessage(
         `Slurm Connect could not read ${settingsPath}. Please add "remote.SSH.useLocalServer": true manually. (${formatError(error)})`
       );
+      return;
+    }
+
+    if (useLocalServer) {
       return;
     }
 
@@ -7424,6 +7502,17 @@ function normalizeSessionMode(value: string): SessionMode {
 
 function normalizeLocalProxyTunnelMode(value: string): LocalProxyTunnelMode {
   return value === 'dedicated' ? 'dedicated' : 'remoteSsh';
+}
+
+function normalizeSshHostKeyChecking(value: string): SshHostKeyCheckingMode {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'ask' || normalized === 'yes' || normalized === 'no') {
+    return normalized;
+  }
+  if (normalized === 'accept-new' || normalized === 'acceptnew' || normalized === 'new') {
+    return 'accept-new';
+  }
+  return 'accept-new';
 }
 
 function buildOverridesFromUi(values: Partial<UiValues>): Partial<SlurmConnectConfig> {

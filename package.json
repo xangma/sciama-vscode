@@ -285,6 +285,17 @@
           "default": "",
           "description": "Optional SSH config path to use when querying the cluster."
         },
+        "slurmConnect.sshHostKeyChecking": {
+          "type": "string",
+          "enum": [
+            "accept-new",
+            "ask",
+            "yes",
+            "no"
+          ],
+          "default": "accept-new",
+          "description": "StrictHostKeyChecking value for non-interactive SSH queries (cluster info, login host discovery, proxy tunnels)."
+        },
         "slurmConnect.sshConnectTimeoutSeconds": {
           "type": "number",
           "default": 15,
