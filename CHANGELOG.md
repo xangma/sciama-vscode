@@ -31,6 +31,7 @@ All notable changes to this project are documented in this file based on git tag
 - Cancel job: allow cancellation in a remote session even when the login host isn't cached.
 - Connect: when no remote folder is set, only open an empty Remote-SSH window instead of falling back to a folder.
 - Cancel job: resolve the remote SSH alias even when no folder is open; allow SLURM_JOB_ID-based cancel when the session key is unavailable.
+- Cancel job: preserve the last known session key/alias instead of overwriting it when a remote window has no folder open.
 - Terminals: detect remote authority via environment variables to avoid local cwd in remote terminals when no folder is open.
 
 ### Added

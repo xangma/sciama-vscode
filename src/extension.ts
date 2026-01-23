@@ -3493,7 +3493,22 @@ function storeConnectionState(state: StoredConnectionState): void {
   if (!extensionGlobalState) {
     return;
   }
-  void extensionGlobalState.update(LAST_CONNECTION_STATE_KEY, { ...state, updatedAt: Date.now() });
+  const normalize = (value?: string): string | undefined => {
+    const trimmed = (value || '').trim();
+    return trimmed ? trimmed : undefined;
+  };
+  const current = getStoredConnectionState() || {};
+  const merged: StoredConnectionState = {
+    alias: normalize(state.alias) || normalize(current.alias),
+    sessionKey: normalize(state.sessionKey) || normalize(current.sessionKey),
+    sessionMode: state.sessionMode || current.sessionMode,
+    loginHost: normalize(state.loginHost) || normalize(current.loginHost),
+    updatedAt: Date.now()
+  };
+  if (!merged.alias && !merged.sessionKey && !merged.loginHost) {
+    return;
+  }
+  void extensionGlobalState.update(LAST_CONNECTION_STATE_KEY, merged);
 }
 
 function getRemoteHomeCache(): RemoteHomeCache {
