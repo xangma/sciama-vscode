@@ -2,6 +2,21 @@
 All notable changes to this project are documented in this file based on git tags and commit history.
 
 ## Unreleased
+
+## 0.5.5 - 2026-02-06
+### Fixed
+- Proxy: ephemeral follow-up connections now stay on Slurm allocation by default; legacy login-shell bypass is opt-in via `--ephemeral-exec-server-bypass`.
+- Proxy: ephemeral shell launch now uses `salloc ... srun ...` so clusters that run `salloc <command>` on login nodes still start VS Code on compute nodes.
+- Remote-SSH settings check now warns when `remote.SSH.connectTimeout` is too low for first-time server download/start and offers to raise it to 300 seconds.
+
+## 0.5.4 - 2026-01-23
+### Fixed
+- Cancel job: preserve the last known session key/alias instead of overwriting it when a remote window has no folder open.
+
+## 0.5.3 - 2026-01-23
+### Added
+- Added `slurmConnect.sshHostKeyChecking` (default `accept-new`) to control host key checking for non-interactive SSH queries and proxy tunnels.
+
 ### Fixed
 - Windows: keep the managed SSH Include path in its configured form (default `~/.ssh/slurm-connect.conf`) so POSIX-style ssh clients do not misinterpret absolute `C:\...` paths.
 - Windows: always offer to persist `remote.SSH.useLocalServer=true` in user settings even when the UI default appears enabled.
@@ -31,11 +46,7 @@ All notable changes to this project are documented in this file based on git tag
 - Cancel job: allow cancellation in a remote session even when the login host isn't cached.
 - Connect: when no remote folder is set, only open an empty Remote-SSH window instead of falling back to a folder.
 - Cancel job: resolve the remote SSH alias even when no folder is open; allow SLURM_JOB_ID-based cancel when the session key is unavailable.
-- Cancel job: preserve the last known session key/alias instead of overwriting it when a remote window has no folder open.
 - Terminals: detect remote authority via environment variables to avoid local cwd in remote terminals when no folder is open.
-
-### Added
-- Added `slurmConnect.sshHostKeyChecking` (default `accept-new`) to control host key checking for non-interactive SSH queries and proxy tunnels.
 
 ## 0.5.2 - 2026-01-22
 ### Added

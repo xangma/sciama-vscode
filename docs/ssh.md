@@ -92,6 +92,11 @@ The "slurmConnect.proxyCommand" setting must execute it, e.g.:
 "slurmConnect.proxyCommand": "python ~/.slurm-connect/vscode-proxy.py"
 ```
 
+Legacy note:
+- Ephemeral follow-up connections no longer bypass Slurm allocation by default.
+- Ephemeral sessions now launch via `salloc ... srun ...` to ensure the shell runs on a compute node even on clusters where `salloc <command>` executes on the login node.
+- If you need the old behavior for compatibility testing, add `"--ephemeral-exec-server-bypass"` to `slurmConnect.proxyArgs`.
+
 ## Local proxy for blocked outbound sites
 If compute/login nodes cannot reach a site but your local machine can, Slurm Connect can run a **built-in local HTTP(S) proxy** and expose it to the cluster via SSH. When enabled, the extension starts the proxy locally (no download required), exposes it on the login host, and sets `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` in the remote session.
 

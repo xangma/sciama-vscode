@@ -7996,6 +7996,33 @@ async function ensureRemoteSshSettings(cfg: SlurmConnectConfig): Promise<void> {
     }
   }
 
+  const recommendedConnectTimeout = 300;
+  const connectTimeoutInspect = remoteCfg.inspect<number>('connectTimeout');
+  const configuredConnectTimeout = Number(
+    connectTimeoutInspect?.globalValue ??
+      connectTimeoutInspect?.workspaceValue ??
+      connectTimeoutInspect?.workspaceFolderValue ??
+      connectTimeoutInspect?.defaultValue ??
+      0
+  );
+  const effectiveConnectTimeout = Number.isFinite(configuredConnectTimeout) ? configuredConnectTimeout : 0;
+  if (effectiveConnectTimeout > 0 && effectiveConnectTimeout < recommendedConnectTimeout) {
+    const raise = await vscode.window.showWarningMessage(
+      `Remote.SSH: Connect Timeout is ${effectiveConnectTimeout}s. First-time connections may need longer to download/start the VS Code server. Set it to ${recommendedConnectTimeout}s?`,
+      `Set to ${recommendedConnectTimeout}s`,
+      'Ignore'
+    );
+    if (raise === `Set to ${recommendedConnectTimeout}s`) {
+      try {
+        await remoteCfg.update('connectTimeout', recommendedConnectTimeout, vscode.ConfigurationTarget.Global);
+      } catch (error) {
+        void vscode.window.showWarningMessage(
+          `Failed to update user settings with remote.SSH.connectTimeout: ${formatError(error)}`
+        );
+      }
+    }
+  }
+
   const tunnelMode = normalizeLocalProxyTunnelMode(cfg.localProxyTunnelMode || 'remoteSsh');
   const useExecServer = remoteCfg.get<boolean>('useExecServer', true);
   if (useExecServer && cfg.localProxyEnabled && tunnelMode === 'remoteSsh') {

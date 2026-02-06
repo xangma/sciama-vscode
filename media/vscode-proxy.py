@@ -1074,10 +1074,17 @@ def build_salloc_command(
     workgroup: Optional[str],
     salloc_args: list[str],
     command: Optional[list[str]] = None,
+    use_pty: bool = False,
 ) -> list[str]:
     args = ["salloc", *salloc_args]
     if command:
-        args.extend(command)
+        # On some clusters, `salloc <command>` runs the command on the login node.
+        # Launch an explicit srun job-step so the shell executes on the allocated node.
+        step = ["srun", "--nodes=1", "--ntasks=1"]
+        if use_pty:
+            step.append("--pty")
+        step.extend(command)
+        args.extend(step)
     return build_slurm_command(invoker, workgroup, args)
 
 
@@ -1440,6 +1447,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Session mode (persistent reuses an allocation).",
     )
     parser.add_argument(
+        "--ephemeral-exec-server-bypass",
+        action="store_true",
+        help=(
+            "In ephemeral mode, bypass Slurm allocation for a short-lived follow-up "
+            "connection. Disabled by default."
+        ),
+    )
+    parser.add_argument(
         "--session-key",
         default="",
         help="Persistent session key (defaults to SSH alias when provided by the extension).",
@@ -1738,10 +1753,24 @@ def main() -> int:
     client_thread: Optional[threading.Thread] = None
 
     session_mode = (args.session_mode or "ephemeral").strip().lower()
+    session_key_raw = (args.session_key or "").strip()
+    logger.info(
+        "Session bootstrap: mode=%s, session_key=%s, stdin_tty=%s, stdout_tty=%s, stderr_tty=%s",
+        session_mode,
+        session_key_raw or "(empty)",
+        sys.stdin.isatty(),
+        sys.stdout.isatty(),
+        sys.stderr.isatty(),
+    )
     exec_server_bootstrap = False
-    if session_mode == "ephemeral":
-        lock_path = resolve_ephemeral_lock_path(args.session_key or "")
+    if session_mode == "ephemeral" and args.ephemeral_exec_server_bypass:
+        lock_path = resolve_ephemeral_lock_path(session_key_raw)
         if lock_path:
+            logger.info(
+                "Ephemeral lock candidate: %s (ttl=%ss)",
+                lock_path,
+                EPHEMERAL_LOCK_TTL_SECONDS,
+            )
             now = time.time()
             if is_recent_lock(lock_path, now):
                 exec_server_bootstrap = True
@@ -1750,6 +1779,9 @@ def main() -> int:
                 )
             else:
                 touch_lock(lock_path, now)
+                logger.info("Ephemeral lock refreshed: %s", lock_path)
+        else:
+            logger.info("Ephemeral lock path unavailable; proceeding without bypass lock.")
 
     command: list[str]
     if session_mode == "persistent":
@@ -1829,11 +1861,20 @@ def main() -> int:
                 shell_cmd = build_login_proxy_shell_command(shell_cmd, tunnel_config)
             else:
                 shell_cmd = build_tunnel_shell_command(shell_cmd, tunnel_config)
+        use_pty = sys.stdin.isatty() and sys.stdout.isatty()
         if exec_server_bootstrap:
             command = shell_cmd
         else:
-            command = build_salloc_command(invoker, workgroup, args.salloc_arg, shell_cmd)
+            command = build_salloc_command(
+                invoker, workgroup, args.salloc_arg, shell_cmd, use_pty=use_pty
+            )
 
+    if session_mode == "persistent":
+        logger.info("Connection path selected: persistent session via srun.")
+    elif exec_server_bootstrap:
+        logger.info("Connection path selected: login-shell bypass (no Slurm allocation).")
+    else:
+        logger.info("Connection path selected: ephemeral allocation via salloc+srun.")
     logger.info("Launching remote shell: %s", " ".join(command))
     try:
         proc = subprocess.Popen(
