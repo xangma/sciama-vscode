@@ -3,6 +3,17 @@ All notable changes to this project are documented in this file based on git tag
 
 ## Unreleased
 
+## 0.5.6 - 2026-02-16
+### Added
+- New `slurmConnect.proxyDebugLogging` setting and Advanced-view toggle to add `-vv` plus a default proxy `--log-file` (`~/.slurm-connect/vscode-proxy-[PID].log`) unless already set in `proxyArgs`.
+
+### Changed
+- Persistent-session connects no longer prompt to disable `remote.SSH.useExecServer`; the warning remains only for local-proxy `remoteSsh` tunnel mode where it is required.
+
+### Fixed
+- Windows: when Remote-SSH uses Windows OpenSSH, Slurm Connect now clears invalid `SSH_AUTH_SOCK`/`SSH_AGENT_PID` values so auth prompts are not suppressed by stale agent env.
+- Bundled proxy diagnostics now capture richer failure context (state snapshots, recent stderr tail, shutdown reason, and remote shell exit details) when startup or handshake rewriting fails.
+
 ## 0.5.5 - 2026-02-06
 ### Fixed
 - Proxy: ephemeral follow-up connections now stay on Slurm allocation by default; legacy login-shell bypass is opt-in via `--ephemeral-exec-server-bypass`.

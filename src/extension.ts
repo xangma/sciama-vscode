@@ -48,6 +48,7 @@ interface SlurmConnectConfig {
   moduleLoad: string;
   proxyCommand: string;
   proxyArgs: string[];
+  proxyDebugLogging: boolean;
   localProxyEnabled: boolean;
   localProxyNoProxy: string[];
   localProxyPort: number;
@@ -201,6 +202,7 @@ const LEGACY_ACTIVE_PROFILE_KEY = 'sciamaSlurm.activeProfile';
 const LEGACY_CLUSTER_INFO_CACHE_KEY = 'sciamaSlurm.clusterInfoCache';
 const DEFAULT_SESSION_STATE_DIR = '~/.slurm-connect';
 const DEFAULT_PROXY_SCRIPT_INSTALL_PATH = '~/.slurm-connect/vscode-proxy.py';
+const DEFAULT_PROXY_DEBUG_LOG_FILE_TEMPLATE = '~/.slurm-connect/vscode-proxy-[PID].log';
 const PROXY_OVERRIDE_RESET_KEY = 'slurmConnect.proxyOverrideReset';
 const SSH_AGENT_ENV_KEY = 'slurmConnect.sshAgentEnv';
 const LAST_CONNECTION_STATE_KEY = 'slurmConnect.lastConnectionState';
@@ -226,6 +228,7 @@ const CONFIG_KEYS = [
   'moduleLoad',
   'proxyCommand',
   'proxyArgs',
+  'proxyDebugLogging',
   'localProxyEnabled',
   'localProxyNoProxy',
   'localProxyPort',
@@ -995,6 +998,7 @@ interface UiValues {
   moduleCustomCommand?: string;
   proxyCommand: string;
   proxyArgs: string;
+  proxyDebugLogging: boolean;
   localProxyEnabled: boolean;
   localProxyNoProxy: string;
   localProxyPort: string;
@@ -1278,6 +1282,7 @@ function pickProfileValues(values: Partial<UiValues>): ProfileValues {
 function buildWebviewValues(values: UiValues): Partial<UiValues> {
   return {
     ...pickProfileValues(values),
+    proxyDebugLogging: values.proxyDebugLogging,
     localProxyEnabled: values.localProxyEnabled,
     localProxyNoProxy: values.localProxyNoProxy,
     localProxyPort: values.localProxyPort,
@@ -1569,6 +1574,7 @@ function getConfigFromSettings(): SlurmConnectConfig {
     moduleLoad: (cfg.get<string>('moduleLoad') || '').trim(),
     proxyCommand: (cfg.get<string>('proxyCommand') || '').trim(),
     proxyArgs: cfg.get<string[]>('proxyArgs', []),
+    proxyDebugLogging: cfg.get<boolean>('proxyDebugLogging', false),
     localProxyEnabled: cfg.get<boolean>('localProxyEnabled', false),
     localProxyNoProxy: cfg.get<string[]>('localProxyNoProxy', []),
     localProxyPort: cfg.get<number>('localProxyPort', 0),
@@ -1630,6 +1636,7 @@ function getConfigDefaultsFromSettings(): SlurmConnectConfig {
     moduleLoad: String(getDefault<string>('moduleLoad', '') || '').trim(),
     proxyCommand: String(getDefault<string>('proxyCommand', '') || '').trim(),
     proxyArgs: getDefault<string[]>('proxyArgs', []),
+    proxyDebugLogging: Boolean(getDefault<boolean>('proxyDebugLogging', false)),
     localProxyEnabled: Boolean(getDefault<boolean>('localProxyEnabled', false)),
     localProxyNoProxy: getDefault<string[]>('localProxyNoProxy', []),
     localProxyPort: Number(getDefault<number>('localProxyPort', 0)),
@@ -3574,16 +3581,6 @@ function isWindowsNamedPipe(value: string): boolean {
   return lower.startsWith('\\\\.\\pipe\\') || lower.startsWith('//./pipe/');
 }
 
-function looksLikeMsysSocket(value: string): boolean {
-  if (!value) {
-    return false;
-  }
-  if (value.startsWith('/')) {
-    return true;
-  }
-  return value.includes('/ssh/') || value.includes('/agent/');
-}
-
 function stripOuterQuotes(value: string): string {
   const trimmed = value.trim();
   if (trimmed.length < 2) {
@@ -3639,9 +3636,25 @@ async function ensureSshAgentEnvForCurrentSsh(identityPathRaw?: string): Promise
   const sshPath = await resolveSshToolPath('ssh');
   if (!isGitSshPath(sshPath)) {
     const existingSock = process.env.SSH_AUTH_SOCK || '';
-    if (existingSock && !isWindowsNamedPipe(existingSock) && looksLikeMsysSocket(existingSock)) {
-      log.appendLine(`Clearing SSH_AUTH_SOCK for Windows OpenSSH (${existingSock}).`);
-      delete process.env.SSH_AUTH_SOCK;
+    const existingPid = process.env.SSH_AGENT_PID || '';
+    if (existingSock) {
+      let keepSocket = false;
+      if (isWindowsNamedPipe(existingSock)) {
+        try {
+          const sshAdd = await resolveSshToolPath('ssh-add');
+          const probe = await probeSshAgentWithEnv(sshAdd, { sock: existingSock, pid: existingPid || undefined });
+          keepSocket = probe.status !== 'unavailable';
+        } catch {
+          keepSocket = false;
+        }
+      }
+      if (!keepSocket) {
+        log.appendLine(`Clearing SSH_AUTH_SOCK for Windows OpenSSH (${existingSock}).`);
+        delete process.env.SSH_AUTH_SOCK;
+        delete process.env.SSH_AGENT_PID;
+      }
+    } else if (existingPid) {
+      log.appendLine('Clearing SSH_AGENT_PID without SSH_AUTH_SOCK for Windows OpenSSH.');
       delete process.env.SSH_AGENT_PID;
     }
     log.appendLine(`Skipping Git ssh-agent setup (SSH path: ${sshPath}).`);
@@ -6069,6 +6082,17 @@ function buildProxyArgs(
   localProxyPlan?: LocalProxyPlan
 ): string[] {
   const args = cfg.proxyArgs.filter(Boolean);
+  if (cfg.proxyDebugLogging) {
+    const hasVerbose = args.some((arg) => /^-v+$/.test(arg) || arg === '--verbose');
+    const hasQuiet = args.some((arg) => /^-q+$/.test(arg) || arg === '--quiet');
+    if (!hasVerbose && !hasQuiet) {
+      args.push('-vv');
+    }
+    const hasLogFile = args.some((arg) => arg === '--log-file' || arg.startsWith('--log-file='));
+    if (!hasLogFile) {
+      args.push(`--log-file=${DEFAULT_PROXY_DEBUG_LOG_FILE_TEMPLATE}`);
+    }
+  }
   if (localProxyPlan?.computeTunnel) {
     const tunnel = localProxyPlan.computeTunnel;
     args.push('--local-proxy-tunnel');
@@ -8043,17 +8067,6 @@ async function ensureRemoteSshSettings(cfg: SlurmConnectConfig): Promise<void> {
     }
   }
 
-  const updatedUseExecServer = remoteCfg.get<boolean>('useExecServer', true);
-  if (updatedUseExecServer && cfg.sessionMode === 'persistent') {
-    const disable = await vscode.window.showWarningMessage(
-      'Remote.SSH: Use Exec Server is enabled. This can prevent reconnecting to persistent Slurm sessions.',
-      'Disable',
-      'Ignore'
-    );
-    if (disable === 'Disable') {
-      await remoteCfg.update('useExecServer', false, vscode.ConfigurationTarget.Global);
-    }
-  }
 }
 
 async function refreshRemoteSshHosts(): Promise<void> {
@@ -8335,6 +8348,7 @@ function getUiValuesFromConfig(cfg: SlurmConnectConfig, cache?: ClusterUiCache):
     moduleCustomCommand: getCachedUiValue(cache, 'moduleCustomCommand'),
     proxyCommand: fromCache('proxyCommand', cfg.proxyCommand || ''),
     proxyArgs: fromCache('proxyArgs', cfg.proxyArgs.join('\n')),
+    proxyDebugLogging: cfg.proxyDebugLogging,
     localProxyEnabled: cfg.localProxyEnabled,
     localProxyNoProxy: cfg.localProxyNoProxy.join('\n'),
     localProxyPort: String(cfg.localProxyPort ?? 0),
@@ -8386,6 +8400,9 @@ async function updateLocalProxySettingsFromUi(
   const updates: Array<Thenable<void>> = [];
   if (has('localProxyEnabled')) {
     updates.push(cfg.update('localProxyEnabled', Boolean(values.localProxyEnabled), target));
+  }
+  if (has('proxyDebugLogging')) {
+    updates.push(cfg.update('proxyDebugLogging', Boolean(values.proxyDebugLogging), target));
   }
   if (has('localProxyNoProxy')) {
     const list = parseListInput(String(values.localProxyNoProxy ?? ''));
@@ -9378,6 +9395,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
     </div>
     <div class="hint">Advanced local proxy settings live in VS Code Settings.</div>
     <div class="checkbox">
+      <input id="proxyDebugLogging" type="checkbox" />
+      <label for="proxyDebugLogging">Enable proxy debug logging</label>
+    </div>
+    <div class="hint">Writes proxy logs to <code>~/.slurm-connect/vscode-proxy-[PID].log</code>.</div>
+    <div class="checkbox">
       <input id="forwardAgent" type="checkbox" />
       <label for="forwardAgent">Forward agent</label>
     </div>
@@ -9613,6 +9635,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       set('preSshCheckCommand', defaults.preSshCheckCommand);
       set('additionalSshOptions', defaults.additionalSshOptions);
       set('localProxyEnabled', defaults.localProxyEnabled);
+      set('proxyDebugLogging', defaults.proxyDebugLogging);
       set('forwardAgent', defaults.forwardAgent);
       set('requestTTY', defaults.requestTTY);
       scheduleAutoSave();
@@ -11559,6 +11582,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         moduleLoad: getValue('moduleLoad'),
         moduleSelections: selectedModules.slice(),
         moduleCustomCommand: customModuleCommand,
+        proxyDebugLogging: getValue('proxyDebugLogging'),
         localProxyEnabled: getValue('localProxyEnabled'),
         extraSallocArgs: getValue('extraSallocArgs'),
         promptForExtraSallocArgs: getValue('promptForExtraSallocArgs'),

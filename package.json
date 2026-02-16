@@ -2,7 +2,7 @@
   "name": "slurm-connect",
   "displayName": "Slurm Connect",
   "description": "Connect VS Code to Slurm allocations.",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "publisher": "xangma",
   "repository": "https://github.com/xangma/slurm-connect",
   "engines": {
@@ -138,6 +138,11 @@
           "type": "array",
           "default": [],
           "description": "Extra arguments appended to the proxy command."
+        },
+        "slurmConnect.proxyDebugLogging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable proxy debug logging by adding -vv and a default --log-file path unless overridden in proxyArgs."
         },
         "slurmConnect.localProxyEnabled": {
           "type": "boolean",

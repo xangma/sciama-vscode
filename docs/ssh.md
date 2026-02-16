@@ -78,6 +78,7 @@ python ~/.slurm-connect/vscode-proxy.py
 ```
 
 Remote-SSH needs the proxy to attach to the compute allocation. The proxy command (and optional `proxyArgs`) are advanced, settings.json-only overrides (not shown in the UI). If you disable auto-install or use a different path or script name, update `slurmConnect.proxyCommand` accordingly.
+For troubleshooting, enable `slurmConnect.proxyDebugLogging` to automatically add `-vv` and a default `--log-file` path (`~/.slurm-connect/vscode-proxy-[PID].log`) unless those flags are already set in `proxyArgs`.
 Auto-install is controlled by `slurmConnect.autoInstallProxyScriptOnClusterInfo` (default on) and uses the bundled script (no GitHub fetch at runtime).
 If you disable auto-install, make sure the proxy script already exists at the configured path.
 

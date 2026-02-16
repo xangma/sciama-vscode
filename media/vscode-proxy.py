@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import deque
 import errno
 import json
 import logging
@@ -38,6 +39,8 @@ DEFAULT_SESSION_JOB_NAME = "slurm-connect"
 CLIENT_TOUCH_INTERVAL = 30.0
 MONITOR_CHECK_INTERVAL = 15
 DEFAULT_LOG_FILE_TEMPLATE = ""
+STDERR_TAIL_MAX_LINES = 20
+STDERR_TAIL_MAX_CHARS = 500
 TERMINAL_JOB_STATES = {
     "CANCELLED",
     "COMPLETED",
@@ -1561,17 +1564,23 @@ def open_optional_file(path: Optional[str], pid: int, label: str) -> Optional[ob
         raise RuntimeError(f"Failed to open {label} file {expanded}: {exc}") from exc
 
 
-def terminate_process(proc: subprocess.Popen, logger: logging.Logger) -> None:
+def terminate_process(
+    proc: subprocess.Popen, logger: logging.Logger
+) -> Tuple[Optional[int], str]:
     if proc.poll() is not None:
-        return
+        return proc.poll(), "already-exited"
     try:
         proc.terminate()
         proc.wait(timeout=5)
+        return proc.poll(), "terminated"
     except Exception:
         try:
             proc.kill()
+            proc.wait(timeout=5)
+            return proc.poll(), "killed"
         except Exception:
             logger.debug("Failed to kill process.", exc_info=True)
+            return proc.poll(), "kill-failed"
 
 
 def resolve_remote_shell() -> str:
@@ -1751,6 +1760,12 @@ def main() -> int:
     state = SharedState()
     marker = f"__SLURM_CONNECT_PROXY_{pid}_{uuid.uuid4().hex}__"
     client_thread: Optional[threading.Thread] = None
+    proc_started_at = time.monotonic()
+    shutdown_reason: Optional[str] = None
+    shutdown_lock = threading.Lock()
+    stderr_tail = deque(maxlen=STDERR_TAIL_MAX_LINES)
+    stderr_tail_lock = threading.Lock()
+    failure_diagnostics_logged = threading.Event()
 
     session_mode = (args.session_mode or "ephemeral").strip().lower()
     session_key_raw = (args.session_key or "").strip()
@@ -1914,10 +1929,60 @@ def main() -> int:
     )
     proxy_server.start()
 
+    def state_snapshot() -> dict:
+        with condition:
+            return {
+                "target_host": state.target_host,
+                "target_port": state.target_port,
+                "listening_seen": state.listening_seen,
+                "proxy_ready": state.proxy_ready,
+                "proxy_failed": state.proxy_failed,
+            }
+
+    def log_state_snapshot(prefix: str, level: int = logging.INFO) -> None:
+        snap = state_snapshot()
+        logger.log(
+            level,
+            "%s target_host=%s target_port=%s listening_seen=%s proxy_ready=%s proxy_failed=%s",
+            prefix,
+            snap["target_host"] or "",
+            snap["target_port"] if snap["target_port"] is not None else "",
+            snap["listening_seen"],
+            snap["proxy_ready"],
+            snap["proxy_failed"],
+        )
+
+    def remember_stderr_line(raw: str) -> None:
+        line = raw.rstrip("\r\n")
+        if len(line) > STDERR_TAIL_MAX_CHARS:
+            line = f"{line[:STDERR_TAIL_MAX_CHARS]}...[truncated]"
+        with stderr_tail_lock:
+            stderr_tail.append(line)
+
+    def log_recent_stderr_tail(level: int, context: str) -> None:
+        with stderr_tail_lock:
+            lines = list(stderr_tail)
+        if not lines:
+            logger.log(level, "Recent stderr tail unavailable (%s).", context)
+            return
+        logger.log(level, "Recent stderr tail (%s, %d lines):", context, len(lines))
+        for idx, line in enumerate(lines, start=1):
+            logger.log(level, "stderr_tail[%02d]: %s", idx, line)
+
+    def emit_failure_diagnostics(context: str) -> None:
+        if failure_diagnostics_logged.is_set():
+            return
+        failure_diagnostics_logged.set()
+        log_state_snapshot(f"Failure snapshot ({context}):", level=logging.ERROR)
+        log_recent_stderr_tail(logging.ERROR, context)
+
     def request_shutdown(reason: str) -> None:
         if shutdown_event.is_set():
             return
         logger.info("Shutdown requested: %s", reason)
+        with shutdown_lock:
+            nonlocal shutdown_reason
+            shutdown_reason = reason
         shutdown_event.set()
         with condition:
             state.shutdown = True
@@ -1958,6 +2023,7 @@ def main() -> int:
                 info = parse_listening_on_line(line)
                 if not info:
                     logger.error("Unable to parse listeningOn line: %s", line.rstrip())
+                    emit_failure_diagnostics("unparseable listeningOn in stdout")
                     parsing_failed = True
                     stdout_stream.write(line)
                     continue
@@ -1971,6 +2037,7 @@ def main() -> int:
                 maybe_start_proxy()
 
                 rewritten = None
+                proxy_failed = False
                 while not shutdown_event.is_set():
                     with condition:
                         if state.proxy_ready and state.proxy_port is not None:
@@ -1979,6 +2046,7 @@ def main() -> int:
                             )
                             break
                         if state.proxy_failed:
+                            proxy_failed = True
                             break
                         if not state.proxy_start_requested and state.target_host:
                             state.proxy_start_requested = True
@@ -1987,6 +2055,13 @@ def main() -> int:
                 if rewritten:
                     stdout_stream.write(rewritten)
                 else:
+                    if proxy_failed:
+                        logger.error(
+                            "Proxy startup failed before listeningOn rewrite (stdout)."
+                        )
+                        emit_failure_diagnostics(
+                            "proxy startup failed before rewrite (stdout)"
+                        )
                     stdout_stream.write(listening_line)
                 continue
 
@@ -2003,12 +2078,16 @@ def main() -> int:
             and not listening_seen
         ):
             logger.error("Target host discovered but no listeningOn= line detected.")
+            emit_failure_diagnostics(
+                "target host discovered but listeningOn line not observed"
+            )
         request_shutdown("remote stdout closed")
 
     def stderr_worker() -> None:
         for line in iter(proc.stderr.readline, ""):
             if shutdown_event.is_set():
                 break
+            remember_stderr_line(line)
             if marker in line:
                 hostname = parse_hostname_marker(line, marker)
                 if hostname:
@@ -2032,6 +2111,7 @@ def main() -> int:
                         "Unable to parse listeningOn line (stderr): %s",
                         line.rstrip(),
                     )
+                    emit_failure_diagnostics("unparseable listeningOn in stderr")
                     stderr_stream.write(line)
                     continue
                 listening_info = info
@@ -2044,6 +2124,7 @@ def main() -> int:
                 maybe_start_proxy()
 
                 rewritten = None
+                proxy_failed = False
                 while not shutdown_event.is_set():
                     with condition:
                         if state.proxy_ready and state.proxy_port is not None:
@@ -2052,6 +2133,7 @@ def main() -> int:
                             )
                             break
                         if state.proxy_failed:
+                            proxy_failed = True
                             break
                         if not state.proxy_start_requested and state.target_host:
                             state.proxy_start_requested = True
@@ -2060,6 +2142,13 @@ def main() -> int:
                 if rewritten:
                     stdout_stream.write(rewritten)
                 else:
+                    if proxy_failed:
+                        logger.error(
+                            "Proxy startup failed before listeningOn rewrite (stderr)."
+                        )
+                        emit_failure_diagnostics(
+                            "proxy startup failed before rewrite (stderr)"
+                        )
                     stdout_stream.write(listening_line)
                 stderr_stream.write(line)
                 continue
@@ -2120,7 +2209,7 @@ def main() -> int:
     except KeyboardInterrupt:
         request_shutdown("keyboard interrupt")
 
-    terminate_process(proc, logger)
+    proc_returncode, termination_mode = terminate_process(proc, logger)
     proxy_server.stop()
 
     stdout_thread.join(timeout=2)
@@ -2129,6 +2218,36 @@ def main() -> int:
     proxy_server.join(timeout=2)
     if client_thread:
         client_thread.join(timeout=2)
+
+    with shutdown_lock:
+        final_reason = shutdown_reason or "unknown"
+    elapsed = time.monotonic() - proc_started_at
+    if proc_returncode is None:
+        logger.warning(
+            "Remote shell exit status unavailable after %.2fs (termination=%s).",
+            elapsed,
+            termination_mode,
+        )
+    elif proc_returncode < 0:
+        logger.info(
+            "Remote shell exited after %.2fs via signal %d (termination=%s).",
+            elapsed,
+            -proc_returncode,
+            termination_mode,
+        )
+    else:
+        logger.info(
+            "Remote shell exited after %.2fs with code %d (termination=%s).",
+            elapsed,
+            proc_returncode,
+            termination_mode,
+        )
+    log_state_snapshot(f"Final state snapshot (reason={final_reason}):")
+
+    if proc_returncode not in (None, 0):
+        emit_failure_diagnostics(
+            f"remote shell exited non-zero ({proc_returncode})"
+        )
 
     close_tees()
 

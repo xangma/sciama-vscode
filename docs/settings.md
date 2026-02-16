@@ -4,7 +4,7 @@ All settings live under the `slurmConnect` namespace.
 
 ## Profiles vs global
 - The Slurm Connect view saves its form values into profiles. Editing the UI no longer writes those values back to settings.
-- Global-only settings stay in VS Code settings and are not shown in the view: `sshHostPrefix`, `temporarySshConfigPath`, `sshQueryConfigPath`, `sshHostKeyChecking`, `sessionStateDir`, `autoInstallProxyScriptOnClusterInfo`, and `sshConnectTimeoutSeconds` (plus `proxyCommand`/`proxyArgs`). The view only shows the local proxy enable toggle; advanced local proxy settings stay in VS Code settings.
+- Global-only settings stay in VS Code settings and are not shown in the view: `sshHostPrefix`, `temporarySshConfigPath`, `sshQueryConfigPath`, `sshHostKeyChecking`, `sessionStateDir`, `autoInstallProxyScriptOnClusterInfo`, and `sshConnectTimeoutSeconds` (plus `proxyCommand`/`proxyArgs`). The view shows the local proxy enable toggle and proxy debug logging toggle; other advanced local proxy settings stay in VS Code settings.
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -26,6 +26,7 @@ All settings live under the `slurmConnect` namespace.
 | `slurmConnect.moduleLoad` | string | `""` | Optional module load command prepended to the RemoteCommand. |
 | `slurmConnect.proxyCommand` | string | `"python ~/.slurm-connect/vscode-proxy.py"` | Advanced: Command that launches the Slurm proxy script on the remote host (not shown in the UI). |
 | `slurmConnect.proxyArgs` | array | `[]` | Extra arguments appended to the proxy command. |
+| `slurmConnect.proxyDebugLogging` | boolean | `false` | Enables proxy debug logging by adding `-vv` and a default `--log-file` path unless you already set those in `proxyArgs`. |
 | `slurmConnect.localProxyEnabled` | boolean | `false` | Enable the built-in local HTTP(S) proxy for remote sessions (proxies all non-loopback hosts). |
 | `slurmConnect.localProxyNoProxy` | array | `["localhost", "127.0.0.1"]` | Hosts that should bypass the local proxy (NO_PROXY) on the remote side. |
 | `slurmConnect.localProxyPort` | number | `0` | Local proxy listen port (0 chooses a random available port). |
@@ -57,6 +58,7 @@ All settings live under the `slurmConnect` namespace.
 | `slurmConnect.sshConnectTimeoutSeconds` | number | `15` | Timeout for SSH resource queries and proxy tunnel setup in seconds. |
 
 ## Notes
-- `proxyCommand` and `proxyArgs` are advanced overrides and are not exposed in the UI.
+- `proxyCommand` and `proxyArgs` are advanced proxy overrides and are not exposed in the UI.
+- `proxyDebugLogging` is exposed in the Advanced section as a toggle.
 - Array settings accept JSON arrays in settings.json; the UI uses newline-separated values where applicable.
 - `additionalSshOptions` is a map of SSH config keys to values (written into generated host entries).
