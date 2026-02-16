@@ -3,6 +3,16 @@ All notable changes to this project are documented in this file based on git tag
 
 ## Unreleased
 
+## 0.5.7 - 2026-02-16
+### Changed
+- Resource hints now report aggregate free CPU/GPU capacity and clearer per-node maxima; GPU metrics are shown only for GPU-capable partitions.
+- Advanced settings now use a single default source of truth, including per-field reset-to-default controls to avoid stale/desynced overrides.
+
+### Fixed
+- Partition switching now preserves GPU selections for GPU partitions while preventing stale GPU requests from being sent when a CPU-only partition is selected.
+- Persistent-session disconnect and cancel-job flows now close Remote-SSH and complete cancellation in a deterministic order.
+- Persistent mode now auto-cancels newly submitted jobs when startup exits before reaching Remote-SSH ready state (including pending-close scenarios), while leaving reused sessions untouched.
+
 ## 0.5.6 - 2026-02-16
 ### Added
 - New `slurmConnect.proxyDebugLogging` setting and Advanced-view toggle to add `-vv` plus a default proxy `--log-file` (`~/.slurm-connect/vscode-proxy-[PID].log`) unless already set in `proxyArgs`.
