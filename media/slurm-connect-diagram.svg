@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1150" height="400" viewBox="0 0 1150 400">
+  <defs>
+    <style>
+      .frame { fill: #ffffff; stroke: #3a72c8; stroke-width: 2; }
+      .cluster { fill: #f7fbff; stroke: #3a72c8; stroke-width: 2; }
+      .title { font: 700 24px system-ui, -apple-system, Segoe UI, Roboto, Arial; fill: #3a72c8; }
+      .label { font: 700 14px system-ui, -apple-system, Segoe UI, Roboto, Arial; fill: #2b4f8b; }
+      .note  { font: 600 12px system-ui, -apple-system, Segoe UI, Roboto, Arial; fill: #2b4f8b; }
+
+      .blueBox { fill: #3f6fbe; stroke: #2b4f8b; stroke-width: 2; }
+      .blueHdr { font: 700 20px system-ui, -apple-system, Segoe UI, Roboto, Arial; fill: #ffffff; }
+      .blueTxt { font: 700 15px system-ui, -apple-system, Segoe UI, Roboto, Arial; fill: #ffffff; }
+
+      .orange { fill: #e47e2b; stroke: #b85e1b; stroke-width: 2; }
+      .orangeTxt { font: 700 15px system-ui, -apple-system, Segoe UI, Roboto, Arial; fill: #ffffff; }
+
+      .green { fill: #6aa845; stroke: #4e7f33; stroke-width: 2; }
+      .greenTxt { font: 700 15px system-ui, -apple-system, Segoe UI, Roboto, Arial; fill: #ffffff; }
+      .greenNote { font: 600 12px system-ui, -apple-system, Segoe UI, Roboto, Arial; fill: #ffffff; }
+
+      .node { fill: #ffffff; stroke: #2b4f8b; stroke-width: 2; }
+      .nodeHdr { font: 800 15px system-ui, -apple-system, Segoe UI, Roboto, Arial; fill: #2b4f8b; }
+
+      .data { stroke: #3a72c8; stroke-width: 2.5; fill: none; }
+      .ctrl { stroke: #e47e2b; stroke-width: 2.5; fill: none; stroke-dasharray: 7 6; }
+    </style>
+
+    <marker id="ahBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#3a72c8"/>
+    </marker>
+    <marker id="ahOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#e47e2b"/>
+    </marker>
+  </defs>
+
+  <!-- Frames -->
+  <rect class="frame" x="10" y="10" width="380" height="380"/>
+  <rect class="frame" x="410" y="10" width="720" height="380"/>
+
+  <text class="title" x="26" y="48">Local OS</text>
+  <text class="title" x="426" y="48">Slurm Cluster</text>
+
+  <!-- Legend -->
+  <line class="data" x1="580" y1="55" x2="640" y2="55" marker-end="url(#ahBlue)"/>
+  <text class="label" x="650" y="60">Remote-SSH data path</text>
+
+  <line class="ctrl" x1="820" y1="55" x2="880" y2="55" marker-end="url(#ahOrange)"/>
+  <text class="label" x="890" y="60" fill="#b85e1b">slurm-connect control path</text>
+
+  <!-- Local VS Code -->
+  <rect class="blueBox" x="80" y="90" width="240" height="250"/>
+  <text class="blueHdr" x="200" y="130" text-anchor="middle">VS Code</text>
+
+  <rect class="orange" x="105" y="165" width="190" height="45"/>
+  <text class="orangeTxt" x="200" y="193" text-anchor="middle">Remote-SSH</text>
+
+  <rect class="orange" x="105" y="225" width="190" height="45"/>
+  <text class="orangeTxt" x="200" y="253" text-anchor="middle">slurm-connect</text>
+
+  <!-- Local SSH config -->
+  <rect class="green" x="90" y="282" width="220" height="54" rx="6"/>
+  <text class="greenNote" x="200" y="305" text-anchor="middle">~/.ssh/config</text>
+  <text class="greenNote" x="200" y="323" text-anchor="middle">+ ~/.ssh/slurm-connect.conf</text>
+
+  <!-- Login Node -->
+  <rect class="node" x="450" y="110" width="260" height="240" rx="12"/>
+  <text class="nodeHdr" x="580" y="138" text-anchor="middle">Login Node</text>
+
+  <rect class="green" x="480" y="170" width="200" height="40" rx="6"/>
+  <text class="greenTxt" x="580" y="195" text-anchor="middle">SSH daemon</text>
+
+  <rect class="green" x="480" y="225" width="200" height="45" rx="6"/>
+  <text class="greenTxt" x="580" y="247" text-anchor="middle">vscode-proxy.py</text>
+  <text class="greenNote" x="580" y="262" text-anchor="middle">(RemoteCommand)</text>
+
+  <text class="note" x="580" y="298" text-anchor="middle">ephemeral: salloc + srun</text>
+  <text class="note" x="580" y="315" text-anchor="middle">persistent: sbatch + srun (--overlap)</text>
+
+  <!-- Compute Node -->
+  <rect class="node" x="760" y="150" width="330" height="150" rx="12"/>
+  <text class="nodeHdr" x="925" y="178" text-anchor="middle">Compute Node (Allocated)</text>
+
+  <rect class="blueBox" x="790" y="200" width="200" height="50" rx="8"/>
+  <text class="blueTxt" x="890" y="232" text-anchor="middle">VS Code Server</text>
+
+  <rect class="green" x="1000" y="200" width="75" height="40" rx="6"/>
+  <text class="greenTxt" x="1037" y="225" text-anchor="middle">Debug</text>
+
+  <!-- Remote-SSH data path -->
+  <path class="data" d="M 295 188 C 360 188, 420 188, 480 188" marker-end="url(#ahBlue)"/>
+  <path class="data" d="M 680 188 C 700 188, 700 247, 680 247" marker-end="url(#ahBlue)"/>
+  <path class="data" d="M 680 247 C 740 247, 760 225, 790 225" marker-end="url(#ahBlue)"/>
+
+  <!-- slurm-connect control path -->
+  <path class="ctrl" d="M 295 247 C 420 247, 480 225, 480 225" marker-end="url(#ahOrange)"/>
+  <path class="ctrl" d="M 295 247 C 350 270, 350 310, 295 310" marker-end="url(#ahOrange)"/>
+
+</svg>
