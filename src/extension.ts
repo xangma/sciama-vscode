@@ -9059,8 +9059,8 @@ function buildOverridesFromUi(values: Partial<UiValues>): Partial<SlurmConnectCo
   return overrides;
 }
 
-function getWebviewHtml(webview: vscode.Webview): string {
-  const nonce = String(Date.now());
+function getWebviewHtml(webview: vscode.Webview, nonceOverride?: string): string {
+  const nonce = nonceOverride ?? String(Date.now());
   const csp = [
     "default-src 'none'",
     `style-src ${webview.cspSource} 'unsafe-inline'`,
@@ -9689,7 +9689,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
   </div>
 
   <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
+    const vscode =
+      typeof acquireVsCodeApi === 'function'
+        ? acquireVsCodeApi()
+        : { postMessage() {}, setState() {}, getState() { return {}; } };
     const FREE_RESOURCE_STALE_MS = 10 * 60 * 1000;
     let clusterInfo = null;
     let clusterInfoFetchedAt = null;
@@ -10401,6 +10404,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function updateActionBarSpacer() {
+      if (document.body && document.body.getAttribute('data-slurm-connect-snapshot') === '1') {
+        document.body.style.paddingBottom = '12px';
+        return;
+      }
       const bar = document.querySelector('.action-bar');
       if (!bar) return;
       const height = Math.ceil(bar.getBoundingClientRect().height);
@@ -12640,6 +12647,75 @@ function getWebviewHtml(webview: vscode.Webview): string {
   </script>
 </body>
 </html>`;
+}
+
+function getSnapshotThemeVarsCss(): string {
+  return `<style id="slurm-connect-snapshot-theme-vars">
+  :root {
+    --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --vscode-foreground: #24292f;
+    --vscode-descriptionForeground: #57606a;
+    --vscode-editor-background: #ffffff;
+    --vscode-sideBar-background: #ffffff;
+    --vscode-panel-border: #d0d7de;
+    --vscode-input-background: #ffffff;
+    --vscode-input-foreground: #24292f;
+    --vscode-input-border: #c6cbd1;
+    --vscode-widget-border: #c6cbd1;
+    --vscode-focusBorder: #0969da;
+    --vscode-button-background: #0969da;
+    --vscode-button-foreground: #ffffff;
+    --vscode-button-hoverBackground: #0860ca;
+    --vscode-button-secondaryBackground: #eaeef2;
+    --vscode-button-secondaryForeground: #24292f;
+    --vscode-button-secondaryHoverBackground: #d0d7de;
+    --vscode-checkbox-background: #ffffff;
+    --vscode-checkbox-border: #8c959f;
+    --vscode-checkbox-foreground: #ffffff;
+    --vscode-list-hoverBackground: #f3f4f6;
+    --vscode-list-activeSelectionBackground: #ddf4ff;
+    --vscode-list-activeSelectionForeground: #0b3066;
+    --vscode-disabledForeground: #8c959f;
+  }
+  body[data-slurm-connect-snapshot="1"] {
+    padding-bottom: 12px !important;
+  }
+  body[data-slurm-connect-snapshot="1"] .action-bar {
+    position: static;
+    left: auto;
+    right: auto;
+    bottom: auto;
+    margin-top: 12px;
+    padding: 8px 0 0;
+    background: transparent;
+  }
+  body[data-slurm-connect-snapshot="1"] .action-main {
+    width: 100%;
+  }
+  </style>`;
+}
+
+export function renderWebviewHtmlForSnapshot(options?: {
+  cspSource?: string;
+  nonce?: string;
+  injectThemeVars?: boolean;
+  openProfilesSection?: boolean;
+}): string {
+  const cspSource = options?.cspSource || 'https://snapshot.invalid';
+  const nonce = options?.nonce || 'slurm-connect-snapshot';
+  let html = getWebviewHtml({ cspSource } as vscode.Webview, nonce);
+  html = html.replace('<body>', '<body data-slurm-connect-snapshot="1">');
+  if (options?.injectThemeVars !== false) {
+    html = html.replace('</head>', `${getSnapshotThemeVarsCss()}\n</head>`);
+  }
+  if (options?.openProfilesSection !== false) {
+    html = html.replace(
+      '<details class="section" id="profilesSection">',
+      '<details class="section" id="profilesSection" open>'
+    );
+    html = html.replace('profilesSection: false,', 'profilesSection: true,');
+  }
+  return html;
 }
 
 function formatError(error: unknown): string {

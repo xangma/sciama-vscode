@@ -321,7 +321,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",
-    "test": "npm run compile && node ./out/test/extension.test.js"
+    "test": "npm run compile && node ./out/test/extension.test.js",
+    "screenshot:webview": "node ./scripts/capture-webview-screenshot.js"
   },
   "devDependencies": {
     "@types/node": "^18.19.3",
