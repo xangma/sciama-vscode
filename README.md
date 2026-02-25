@@ -1,8 +1,4 @@
-<p align="center">
-  <img src="media/slurm-connect.svg" alt="Slurm Connect logo" width="96" />
-</p>
-
-# Slurm Connect (VS Code extension)
+# <img src="media/slurm-connect-dark.svg#gh-light-mode-only" alt="Slurm Connect logo" width="28" /> <img src="media/slurm-connect.svg#gh-dark-mode-only" alt="Slurm Connect logo" width="28" /> Slurm Connect (VS Code extension)
 
 <a href="media/slurm-connect-ui.png"><img src="media/slurm-connect-ui.png" alt="Slurm Connect webview UI" width="300" align="right" /></a>
 
